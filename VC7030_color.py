@@ -37,7 +37,7 @@ def get_reconstructed_directory():
     os.makedirs(directory, exist_ok=True)
     return directory
 
-def create_meta_image(meta_data, width, height):
+def create_meta_image(meta_data, width, height, rgb=False):
     try:
         # Minimal metadata
         minimal_meta = {
@@ -49,10 +49,11 @@ def create_meta_image(meta_data, width, height):
             'h': height,
             'tb': meta_data['total_bits']
         }
-        # FEC stream parameters (only present when the stream was FEC-coded).
-        # The decoder keys off meta['fec']; without these it falls back to the
-        # legacy in-order path and silently mis-decodes a FEC video.
-        for key in ('fec', 'k', 'm', 'pd', 'B', 'gh'):
+        # Mode + FEC parameters. `color` selects the data channel (8-corner RGB
+        # vs RGB-gray); the decoder keys off it to pick the matching decode
+        # path, so it MUST be embedded. FEC keys are copied when present (FEC
+        # is not supported in this fork, but kept for metadata symmetry).
+        for key in ('color', 'fec', 'k', 'm', 'pd', 'B', 'gh'):
             if key in meta_data:
                 minimal_meta[key] = meta_data[key]
 
@@ -83,6 +84,15 @@ def create_meta_image(meta_data, width, height):
         # Expand each bit to an M_META x M_META block
         expanded = bit_matrix.repeat(M_META, axis=0).repeat(M_META, axis=1)
 
+        if rgb:
+            # The stream is rgb24 (color mode), so the metadata frame is
+            # RGB-gray — each block is black (0,0,0) or white (255,255,255).
+            # All three channels carry the same bit, so a per-channel
+            # threshold in decode_meta_frames recovers it exactly.
+            full = np.zeros((height, width, 3), dtype=np.uint8)
+            full[:blocks_y*M_META, :blocks_x*M_META] = expanded[..., None] * 255
+            return Image.fromarray(full, mode='RGB')
+
         # Create full image
         full_image = np.zeros((height, width), dtype=bool)
         full_image[:blocks_y*M_META, :blocks_x*M_META] = expanded
@@ -96,6 +106,12 @@ def create_meta_image(meta_data, width, height):
         raise
 
 def generate_data_frame(frame_idx, file_path, M, width, height, bits_per_frame, total_bits):
+    """Gray (B/W) mode: 1 file bit per MxM block -> 1-channel gray frame.
+
+    Every block is black (0) or white (255) in a single (H, W) channel — the
+    exact layout of the original program, so gray streams carry no extra
+    weight and decode at original speed.
+    """
     try:
         start_bit = frame_idx * bits_per_frame
         end_bit = min(start_bit + bits_per_frame, total_bits)
@@ -128,9 +144,9 @@ def generate_data_frame(frame_idx, file_path, M, width, height, bits_per_frame, 
         # Expand each bit to an M x M block
         expanded = bit_matrix.repeat(M, axis=0).repeat(M, axis=1)
 
-        # Create full image (gray, 0/255). Return raw bytes directly so the
-        # main process can stream them to ffmpeg without any serialized PIL
-        # conversion in the hot loop.
+        # Gray frame (H, W), 1 byte per pixel — identical layout to the
+        # original program, so the fork's gray mode carries no extra weight.
+        # uint8 * 255 stays uint8 — no int64 blowup per frame.
         full_image = np.zeros((height, width), dtype=np.uint8)
         full_image[:blocks_y*M, :blocks_x*M] = expanded * 255
         return full_image.tobytes()
@@ -138,6 +154,127 @@ def generate_data_frame(frame_idx, file_path, M, width, height, bits_per_frame, 
     except Exception as e:
         logging.error(f"Error generating data frame {frame_idx}: {str(e)}")
         return None
+
+# ---------------------------------------------------------------------------
+# Color channel: 8-corner RGB palette, 3 bits per MxM block (fork extension).
+#
+# Palette = the 8 corners of the RGB cube. Each block's 3 file bits drive one
+# channel each (R, G, B), MSB-first in the flat bitstream: bit 3b, 3b+1, 3b+2
+# set channels R, G, B of block b. So a block is one of:
+#   (0,0,0) black, (255,0,0) red, (0,255,0) green, (0,0,255) blue,
+#   (255,0,255) magenta, (0,255,255) cyan, (255,255,0) yellow, (255,255,255) white.
+#
+# Why this palette is lossless-robust: every channel is independently 0 or
+# 255, so the decode threshold is 128 and the per-channel error margin is 127
+# — the largest any 3-bit palette can give (a 4-level/16-color scheme would
+# drop to ~42 and, measured, gets crossed by x264 deblocking blur ~67). Three
+# bits/block triples the data density per frame vs the gray channel, so a file
+# needs ~3x fewer frames -> faster and smaller video.
+#
+# M must be EVEN so an MxM block covers whole yuv420p (4:2:0) chroma samples;
+# an odd M would split a chroma pixel across two blocks and smear the color.
+# ---------------------------------------------------------------------------
+COLOR_PALETTE = (
+    (0, 0, 0), (255, 0, 0), (0, 255, 0), (0, 0, 255),
+    (255, 0, 255), (0, 255, 255), (255, 255, 0), (255, 255, 255),
+)
+COLOR_BITS_PER_BLOCK = 3   # R, G, B — one bit per channel
+COLOR_CHANNELS = 3         # raw frame layout is (H, W, 3) rgb24
+
+
+def generate_color_frame(frame_idx, file_path, M, width, height,
+                         bits_per_frame, total_bits):
+    """Render stream frame `frame_idx` as an rgb24 frame (H, W, 3).
+
+    3 file bits per MxM block, ordered (R, G, B) in the flat MSB-first
+    bitstream: bit 3b, 3b+1, 3b+2 drive channels R, G, B of block b.
+    Vectorized; the trailing partial frame zero-pads to black like the gray
+    path. Returns raw rgb24 bytes (H*W*3) or None on error.
+    """
+    try:
+        start_bit = frame_idx * bits_per_frame
+        end_bit = min(start_bit + bits_per_frame, total_bits)
+        num_bits = end_bit - start_bit
+
+        blocks_x = width // M
+        blocks_y = height // M
+
+        start_byte = start_bit // 8
+        end_byte = (end_bit + 7) // 8
+        with open(file_path, 'rb') as f:
+            f.seek(start_byte)
+            chunk = f.read(end_byte - start_byte)
+
+        # Vectorized big-endian bit unpack, same bit order as the gray path.
+        bits = np.unpackbits(np.frombuffer(chunk, dtype=np.uint8), bitorder='big')
+        real = bits[start_bit % 8:]
+        bit_array = np.zeros(bits_per_frame, dtype=np.uint8)
+        n_real = min(num_bits, real.size)
+        bit_array[:n_real] = real[:n_real]
+
+        # 3 bits per block: (blocks_y, blocks_x, 3) = (R, G, B).
+        n_blocks = blocks_x * blocks_y
+        rgb = bit_array[:3 * n_blocks].reshape(blocks_y, blocks_x, 3)
+        expanded = rgb.repeat(M, axis=0).repeat(M, axis=1)
+        # uint8 * 255 stays uint8 (0/255) — no int64 blowup per frame.
+        full = np.zeros((height, width, 3), dtype=np.uint8)
+        full[:blocks_y * M, :blocks_x * M] = expanded * 255
+        return full.tobytes()
+    except Exception as e:
+        logging.error(f"Error generating color frame {frame_idx}: {str(e)}")
+        return None
+
+
+def _color_from_frames(frames, M, R, width, height):
+    """Threshold each channel of each MxM block across R copies -> (R,G,B) bits.
+
+    frames: R raw rgb24 buffers (H*W*3 each). For each block, accumulate the R
+    copies per channel; a channel bit is 1 iff the channel sum >= 128*R*M*M
+    (the mean>=128 test without floats). Returns (bits_rgb, n_blocks) where
+    bits_rgb is a (blocks_y, blocks_x, 3) bool array. Integer accumulation into
+    one small (blocks_y, blocks_x, 3) int64 array keeps peak memory low.
+    """
+    cropped_width = (width // M) * M
+    cropped_height = (height // M) * M
+    blocks_x = cropped_width // M
+    blocks_y = cropped_height // M
+    acc = np.zeros((blocks_y, blocks_x, 3), dtype=np.int64)
+    for frame in frames:
+        arr = np.frombuffer(frame, dtype=np.uint8).reshape(height, width, 3)
+        b = arr[:cropped_height, :cropped_width].reshape(blocks_y, M, blocks_x, M, 3)
+        acc += b.sum(axis=(1, 3), dtype=np.int64)
+    thr = 128 * R * M * M
+    bits_rgb = (acc >= thr)
+    return bits_rgb, blocks_x * blocks_y
+
+
+def decode_color_frame(frames, M, R, width, height, frame_idx, meta):
+    """Decode R rgb24 frames back to the file's bytes.
+
+    Reads the 3-bit-per-block (R,G,B) bits, lays them back into the flat
+    MSB-first bitstream (bit 3b,3b+1,3b+2 = R,G,B of block b) and packs to
+    bytes, emitting only this frame's real bytes (final partial frame).
+    """
+    try:
+        bits_rgb, n_blocks = _color_from_frames(frames, M, R, width, height)
+        total_slots = 3 * n_blocks
+        start_bit = frame_idx * total_slots
+        end_bit = min(start_bit + total_slots, meta['tb'])
+        num_bits = end_bit - start_bit
+
+        flat = bits_rgb.reshape(-1).astype(np.uint8)  # (3*n_blocks,) R,G,B interleaved
+        n_bytes = (num_bits + 7) // 8
+        padded = np.zeros(n_bytes * 8, dtype=np.uint8)
+        n_copy = min(num_bits, flat.size)
+        padded[:n_copy] = flat[:n_copy]
+        weights = np.array([128, 64, 32, 16, 8, 4, 2, 1], dtype=np.uint8)
+        byte_data = (padded.reshape(-1, 8) * weights).sum(
+            axis=1, dtype=np.uint8).tobytes()
+        return frame_idx, bytes(byte_data), num_bits
+    except Exception as e:
+        logging.error(f"Error decoding color frame {frame_idx}: {str(e)}")
+        return frame_idx, None, -1
+
 
 def _make_frame_pool(n_slots, frame_bytes):
     """Create a shared-memory pool of n_slots frames plus one free-slot
@@ -234,7 +371,7 @@ def _fec_group_frame(frame_idx, file_path, M, width, height, pd,
 
 def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_bytes,
                        file_path, M, width, height, bits_per_frame, total_bits,
-                       P=None, k_fec=0, pd=0, group_bytes=0, df=0):
+                       P=None, k_fec=0, pd=0, group_bytes=0, df=0, color=False):
     """Encode worker: renders frame `frame_idx` straight into its pool slot
     (frame_idx % n_slots) and reports (frame_idx, slot) on the out queue.
     `slot == -1` signals a generation error. The semaphore guards the slot
@@ -259,7 +396,12 @@ def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_by
                 img = _fec_group_frame(frame_idx, file_path, M, width, height,
                                        pd, group_bytes, k_fec, P, df,
                                        total_bits)
+            elif color:
+                # 8-corner RGB palette, 3 file bits per block.
+                img = generate_color_frame(frame_idx, file_path, M, width, height,
+                                           bits_per_frame, total_bits)
             else:
+                # Gray (B/W) mode: 1 file bit per block, 1-channel stream.
                 img = generate_data_frame(frame_idx, file_path, M, width, height,
                                           bits_per_frame, total_bits)
             if img is None:
@@ -279,7 +421,8 @@ def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_by
                 pass
 
 def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
-                         out_path=None, fec_k=0, fec_m=0, preset='medium'):
+                         out_path=None, fec_k=0, fec_m=0, preset='medium',
+                         color=False):
     try:
         start_time = time.time()
         output_dir = get_output_directory()
@@ -299,33 +442,52 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
             logging.error(f"Width and height must be even for yuv420p (got {width}x{height})")
             return False
 
+        # Color mode: M must be even so an MxM block covers whole yuv420p
+        # (4:2:0) chroma samples. An odd M splits a chroma pixel across two
+        # blocks and smears the color at block boundaries. (Gray mode is
+        # unaffected: an RGB-gray block is chroma-neutral (U=V=128), so a split
+        # chroma sample still decodes to the same neutral value — odd M is fine
+        # there, exactly as in the original program.)
+        if color and M % 2 != 0:
+            logging.error(f"Color mode: M must be even (got M={M}); "
+                          f"odd M would split yuv420p chroma samples across blocks")
+            return False
+
+        # Color fork: the FEC group-header layout (render_payload / 8-byte
+        # header in the first 64 gray blocks) is gray-tuned and is not part of
+        # this fork. R-copy averaging already covers per-bit noise; FEC is the
+        # original program's territory.
+        if fec_k > 0 or fec_m > 0:
+            logging.error("Color fork: FEC is not supported (use the original "
+                          f"program for FEC streams; got --fec-k {fec_k} --fec-m {fec_m})")
+            return False
+
         file_size = os.path.getsize(file_path)
         filename = os.path.basename(file_path)
 
-        # Calculate only whole blocks
+        # Calculate only whole blocks. Bits per block depends on the mode:
+        # color = 3 (R, G, B — 8-corner palette), gray = 1. A color frame
+        # therefore carries 3x the data of a gray frame.
         blocks_x = width // M
         blocks_y = height // M
-        bits_per_frame = blocks_x * blocks_y
+        n_blocks = blocks_x * blocks_y
+        bits_per_block = COLOR_BITS_PER_BLOCK if color else 1
+        bits_per_frame = n_blocks * bits_per_block
 
-        if bits_per_frame == 0:
+        if n_blocks == 0:
             logging.error(f"Need at least one {M}x{M} block; "
                           f"{width}x{height} is too small for M={M}")
             return False
 
         total_bits = file_size * 8
 
-        # --- FEC setup ---
-        # A group frame holds an 8-byte header in its first 64 blocks plus
-        # B = (bits_per_frame - 64)//8 whole payload bytes (the trailing
-        # non-byte blocks are left unused, which keeps stripe rows uniform).
-        # The stream is: n_data data groups + m parity groups per stripe of k
-        # data groups; any k of a stripe's k+m groups recover the stripe.
+        # --- (FEC disabled in this fork; see rejection above) ---
         use_fec = 0
         k_fec = m_fec = 0
         B = max(0, (bits_per_frame - HEADER_BITS) // 8)
         P = None
         n_data = 0
-        if fec_k > 0:
+        if fec_k > 0:  # unreachable: rejected above
             if B < 1:
                 logging.error(f"FEC needs >= {HEADER_BITS + 8} blocks/frame "
                               f"(bits_per_frame={bits_per_frame}); use smaller M")
@@ -344,7 +506,10 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
         else:
             total_frames = (total_bits + bits_per_frame - 1) // bits_per_frame
 
-        # Create metadata
+        # Create metadata. `color` selects the data channel (1 = 8-corner RGB
+        # palette, 0 = RGB-gray); the decoder reads it back to pick the matching
+        # path. create_meta_image copies the recognized keys into the JSON that
+        # is embedded in the video, so it must know about `color` too.
         meta = {
             'filename': filename,
             'file_size': file_size,
@@ -353,12 +518,18 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
             'width': width,
             'height': height,
             'total_bits': total_bits,
+            'color': 1 if color else 0,
         }
         if use_fec:
             with open(file_path, 'rb') as _f:
                 _gh = hash64_file(_f)
             meta.update({'fec': 1, 'k': k_fec, 'm': m_fec, 'pd': n_data,
                          'B': B, 'gh': _gh})
+
+        # Input layout is mode-dependent: color frames are rgb24 (H, W, 3);
+        # gray frames are 1-channel (H, W), identical to the original program,
+        # so gray mode carries no extra weight and keeps its speed/memory.
+        in_pix_fmt = 'rgb24' if color else 'gray'
 
         # Start ffmpeg for video encoding
         ffmpeg_command = [
@@ -367,7 +538,7 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
             '-f', 'rawvideo',       # Input format
             '-vcodec', 'rawvideo',
             '-s', f'{width}x{height}',  # Frame size
-            '-pix_fmt', 'gray',     # Input format: 8-bit gray
+            '-pix_fmt', in_pix_fmt,  # Input format: rgb24 (color) / gray (b/w)
             '-r', '30',             # Frame rate
             '-i', '-',              # Read from stdin
             '-c:v', 'libx264',      # Codec
@@ -384,9 +555,17 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
             stderr=subprocess.DEVNULL
         )
 
-        # Create meta-image and send to ffmpeg
-        meta_img = create_meta_image(meta, width, height)
-        meta_img = meta_img.convert('L')  # Convert to 8-bit format
+        # Create meta-image and send to ffmpeg. The metadata frame's layout
+        # matches the stream's input layout: rgb24 (RGB-gray) for color mode,
+        # 1-channel gray for B/W mode. The data-channel flag rides in the JSON
+        # embedded in this image (meta has a 'color' key) and is read back by
+        # the decoder, which picks the matching pix_fmt + decode path.
+        meta_img = create_meta_image(meta, width, height, rgb=color)
+        if not color:
+            # Gray stream: 8-bit (H, W) bytes, exactly as the original program
+            # sent (its create_meta_image returns mode '1'; tobytes() on that
+            # would be packed 1-bit, not H*W bytes).
+            meta_img = meta_img.convert('L')
         meta_bytes = meta_img.tobytes()
 
         for r in range(R_META):
@@ -401,7 +580,9 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
         task_queue = multiprocessing.Queue()
         out_queue = multiprocessing.Queue()
 
-        frame_size = width * height
+        # Frame bytes per pixel: 3 (rgb24, color mode) or 1 (gray, B/W mode).
+        ch_per_px = COLOR_CHANNELS if color else 1
+        frame_size = width * height * ch_per_px
         pool_n = max(num_processes, 2)
         pool_name, pool_shm, pool_buf, pool_sems = _make_frame_pool(pool_n, frame_size)
 
@@ -412,7 +593,7 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
                 target=_shm_encode_worker,
                 args=(task_queue, out_queue, pool_sems, pool_name, pool_n, frame_size,
                       file_path, M, width, height, bits_per_frame, total_bits,
-                      P, k_fec, B * 8, B, n_data)
+                      P, k_fec, B * 8, B, n_data, color)
             )
             p.start()
             workers.append(p)
@@ -485,7 +666,7 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
         logging.error(f"Critical error during encoding: {str(e)}")
         return False
 
-def decode_meta_frames(meta_frames, width, height):
+def decode_meta_frames(meta_frames, width, height, ch=1):
     try:
         # Calculate cropped dimensions, multiples of M_META
         cropped_width = (width // M_META) * M_META
@@ -494,26 +675,40 @@ def decode_meta_frames(meta_frames, width, height):
         blocks_y = cropped_height // M_META
         total_blocks = blocks_x * blocks_y
 
-        # Convert frames into cropped numpy arrays
+        # Frames carry `ch` channels (1 = gray stream, 3 = rgb24 stream).
+        # The metadata is gray in both cases, so averaging over channels is a
+        # no-op for the bit value — it just handles either layout uniformly.
         meta_arrays = []
         for frame in meta_frames:
-            arr = np.frombuffer(frame, dtype=np.uint8).reshape(height, width)
+            arr = np.frombuffer(frame, dtype=np.uint8).reshape(
+                height, width, ch if ch > 1 else 1)
             # Crop to dimensions that are multiples of the metadata block
             cropped_arr = arr[:cropped_height, :cropped_width]
             meta_arrays.append(cropped_arr)
 
         # Vectorized processing
         stacked = np.stack(meta_arrays)
-        reshaped = stacked.reshape(
-            stacked.shape[0],
-            blocks_y,
-            M_META,
-            blocks_x,
-            M_META
-        )
-
-        # Averaging by block pixels
-        block_avgs = reshaped.mean(axis=(2, 4))
+        if ch > 1:
+            reshaped = stacked.reshape(
+                stacked.shape[0],
+                blocks_y,
+                M_META,
+                blocks_x,
+                M_META,
+                ch
+            )
+            # Averaging by block pixels and channels
+            block_avgs = reshaped.mean(axis=(2, 4, 5))
+        else:
+            reshaped = stacked.reshape(
+                stacked.shape[0],
+                blocks_y,
+                M_META,
+                blocks_x,
+                M_META
+            )
+            # Averaging by block pixels
+            block_avgs = reshaped.mean(axis=(2, 4))
 
         # Averaging by copies
         avg_bits = block_avgs.mean(axis=0)
@@ -549,11 +744,11 @@ def decode_meta_frames(meta_frames, width, height):
 def _bits_from_frames(frames, M, R, width, height):
     """Sum each M x M block's R copies as integers, threshold -> bits (0/1).
 
-    bit = 1 iff the block's sum >= 128 * R * M * M, which is exactly the
-    mean >= 128 test without a float. Integer accumulation into one small
-    (blocks_y, blocks_x) int64 array avoids stacking the R frames (248 MB
-    at 4K) and the transpose, cutting peak memory and passes. Shared by the
-    legacy and FEC group decoders (same channel, same layout)."""
+    Gray mode: frames are 1-channel (H, W), identical layout to the original
+    program. bit = 1 iff the block's sum >= 128 * R * M * M, which is exactly
+    the mean >= 128 test without a float. Integer accumulation into one small
+    (blocks_y, blocks_x) int64 array avoids stacking the R frames and the
+    transpose, cutting peak memory and passes."""
     cropped_width = (width // M) * M
     cropped_height = (height // M) * M
     blocks_x = cropped_width // M
@@ -774,7 +969,12 @@ def _shm_decode_worker(task_queue, output_queue, pool_sems, pool_name,
             base = slot * group_size
             frames = [mv[base + i * frame_size: base + (i + 1) * frame_size]
                       for i in range(R)]
-            result = decode_data_frame(frames, M, R, width, height, seq, meta)
+            # The embedded `color` flag picks the channel: rgb24 frames with
+            # the 3-bit 8-corner palette, or 1-channel gray frames with 1 bit.
+            if meta.get('color'):
+                result = decode_color_frame(frames, M, R, width, height, seq, meta)
+            else:
+                result = decode_data_frame(frames, M, R, width, height, seq, meta)
             output_queue.put(result)
             pool_sems[slot].release()
     except Empty:
@@ -832,17 +1032,19 @@ def _cleanup_decode(ffmpeg_process, reader_thread, stop_event, frame_queue):
     if reader_thread is not None and reader_thread.is_alive():
         reader_thread.join(timeout=5)
 
-def _spawn_reader(video_path, width, height):
+def _spawn_reader(video_path, width, height, pix_fmt='rgb24'):
     """Start ffmpeg raw-frame extraction (resampled to width x height) plus the
-    reader thread. Returns (ffmpeg_process, frame_queue, stop_event,
-    reader_thread, frame_size)."""
-    frame_size = width * height
+    reader thread. `pix_fmt` selects the raw layout: 'rgb24' (color data, H,W,3)
+    or 'gray' (1 channel, H,W — the fast path, identical to the original).
+    Returns (ffmpeg_process, frame_queue, stop_event, reader_thread, frame_size)."""
+    channels = COLOR_CHANNELS if pix_fmt == 'rgb24' else 1
+    frame_size = width * height * channels
     ffmpeg_command = [
         'ffmpeg',
         '-i', video_path,
         '-vf', f'scale={width}:{height}',
         '-f', 'rawvideo',
-        '-pix_fmt', 'gray',
+        '-pix_fmt', pix_fmt,
         '-v', 'error',
         '-'
     ]
@@ -928,9 +1130,14 @@ def decode_video_to_file(video_path, num_processes):
         frame_size = width * height
         logging.info(f"Video size: {width}x{height}, frame size: {frame_size} bytes")
 
-        # 2-3. Start ffmpeg + reader thread (resampled to the probe size)
+        # 2-3. Start ffmpeg + reader thread (resampled to the probe size).
+        # Metadata frames are gray in BOTH modes (black/white blocks), so the
+        # cheap 1-channel gray probe decodes them for gray and color streams
+        # alike; the `color` flag in the embedded JSON then tells us whether
+        # the data phase needs an rgb24 reader (spawned in step 4b2).
         (ffmpeg_process, frame_queue, stop_event,
-         reader_thread, frame_size) = _spawn_reader(video_path, width, height)
+         reader_thread, frame_size) = _spawn_reader(video_path, width, height,
+                                                    pix_fmt='gray')
 
         # 4. Read metadata
         meta_frames = []
@@ -992,8 +1199,10 @@ def decode_video_to_file(video_path, num_processes):
                 ordered.append((cw, ch))
             for cw, ch in ordered:
                 logging.info(f"Geometry probe: rescan metadata at {cw}x{ch}")
+                # gray probe again: the metadata is gray in both modes.
                 (ffmpeg_process, frame_queue, stop_event,
-                 reader_thread, frame_size) = _spawn_reader(video_path, cw, ch)
+                 reader_thread, frame_size) = _spawn_reader(video_path, cw, ch,
+                                                            pix_fmt='gray')
                 mf = []
                 complete = True
                 for _ in range(R_META):
@@ -1023,6 +1232,23 @@ def decode_video_to_file(video_path, num_processes):
                     f"Metadata geometry {meta.get('w')}x{meta.get('h')} != video "
                     f"{width}x{height}; no candidate layout matched"
                 )
+
+        # 4b2. Color mode: the data frames are rgb24 (H, W, 3). The gray
+        # reader above only served the metadata (gray in both modes); now
+        # restart it in rgb24 and consume the R_META metadata copies from the
+        # new stream. Gray streams keep the fast 1-channel reader untouched.
+        if meta.get('color'):
+            _cleanup_decode(ffmpeg_process, reader_thread, stop_event,
+                            frame_queue)
+            (ffmpeg_process, frame_queue, stop_event,
+             reader_thread, frame_size) = _spawn_reader(video_path, width,
+                                                        height, pix_fmt='rgb24')
+            for _ in range(R_META):
+                try:
+                    frame_data = frame_queue.get(timeout=30)
+                except Empty:
+                    raise TimeoutError("Timeout reading metadata (rgb24 stream)")
+            logging.info("Color mode detected; rgb24 reader armed")
 
         filename = meta['fn']
         M = meta['M']
@@ -1136,12 +1362,14 @@ def decode_video_to_file(video_path, num_processes):
                                 frame_queue)
             return success
 
-        # 5. Process data
+        # 5. Process data. Bits per block from the embedded `color` flag:
+        # color = 3 (R,G,B 8-corner palette), gray = 1.
         cropped_width = (width // M) * M
         cropped_height = (height // M) * M
         blocks_x = cropped_width // M
         blocks_y = cropped_height // M
-        bits_per_frame = blocks_x * blocks_y
+        bits_per_block = COLOR_BITS_PER_BLOCK if meta.get('color') else 1
+        bits_per_frame = blocks_x * blocks_y * bits_per_block
         total_frames = (total_bits + bits_per_frame - 1) // bits_per_frame
 
         logging.info(f"Starting decoding: file '{filename}', size {file_size} bytes")
@@ -1340,6 +1568,10 @@ if __name__ == "__main__":
                                help="FEC stripe: k data groups (0 = no FEC)")
     encode_parser.add_argument("--fec-m", type=int, default=0,
                                help="FEC stripe: m parity groups (0 = no FEC)")
+    encode_parser.add_argument("--color", action="store_true",
+                               help="Color mode: 8-corner RGB palette, 3 bits "
+                                    "per block (~3x faster/smaller than gray). "
+                                    "Requires even M. Default: gray (B/W).")
 
     decode_parser = subparsers.add_parser("decode", help="Decode a video to file")
     decode_parser.add_argument("video_path", type=str, help="Video file path")
@@ -1349,7 +1581,7 @@ if __name__ == "__main__":
 
     if args.mode == "encode":
         start_time = time.time()
-        if encode_file_to_video(args.file_path, args.M, args.R, args.width, args.height, args.processes, crf=args.crf, out_path=args.out, fec_k=args.fec_k, fec_m=args.fec_m, preset=args.preset):
+        if encode_file_to_video(args.file_path, args.M, args.R, args.width, args.height, args.processes, crf=args.crf, out_path=args.out, fec_k=args.fec_k, fec_m=args.fec_m, preset=args.preset, color=args.color):
             elapsed = time.time() - start_time
             print(f"Encoding completed successfully in {elapsed:.2f} sec")
         else:
