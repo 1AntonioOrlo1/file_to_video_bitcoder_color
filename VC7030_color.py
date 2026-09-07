@@ -599,20 +599,33 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
             p.start()
             workers.append(p)
 
-        # Dispatch all frame tasks (small ints) plus one poison pill per
-        # worker so they exit once the queue is drained.
-        for idx in range(total_frames):
-            task_queue.put(idx)
-        for _ in range(num_processes):
-            task_queue.put(None)
-
-        # Main loop: collect (frame_idx, slot) results and stream the
-        # finished frames to ffmpeg in order.
+        # Main loop: stream finished frames to ffmpeg in order.
+        #
+        # Frames are dispatched to the workers in a sliding window: a frame
+        # is handed out only once the frame pool_n before it has been
+        # written, so at most one slot cycle is ever in flight. In flight no
+        # two frames share a slot, so a worker never waits on a semaphore
+        # held by another frame (dispatching everything up front let a
+        # worker for frame f+pool_n claim f's slot before f's own worker
+        # got there, deadlocking the ordered writer).
         next_write = 0
+        next_dispatch = 0
+        pills_sent = False
         buffer = {}
 
         try:
             while next_write < total_frames:
+                # Keep the dispatch window ahead of the ordered writer.
+                while (next_dispatch < total_frames
+                       and next_dispatch < next_write + pool_n):
+                    task_queue.put(next_dispatch)
+                    next_dispatch += 1
+                if next_dispatch == total_frames and not pills_sent:
+                    # one poison pill per worker so they exit once drained
+                    for _ in range(num_processes):
+                        task_queue.put(None)
+                    pills_sent = True
+
                 # Write the next frame to ffmpeg if it is ready.
                 if next_write in buffer:
                     slot = buffer.pop(next_write)
