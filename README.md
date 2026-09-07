@@ -10,7 +10,8 @@ A fast and efficient tool for encoding files into video frames. This project is 
 - **Hardware Accelerated:** A specialized NVIDIA **NVENC** variant (`VC7030_nvenc_final_fixed.py`) is available for maximum encoding speed.
 - **Resilient:** Uses redundant frame copies ($R$, default 30) and block averaging to survive lossy H.264 compression.
 - **Stall-safe decoding:** the decoder loop has a watchdog that aborts with a clear error instead of hanging when the frame stream ends unexpectedly; incomplete reconstructions are removed on failure.
-- **Geometry realignment:** if a video was (re)encoded at a different size than the payload was embedded at (e.g. a host downscaling 720p to 360p), the decoder probes candidate layouts until the embedded metadata parses and the payload is recovered — verified SHA-256-identical for 640x360 and 320x180 downscales, including down-then-upscale re-hosting cycles.
+- **No resampling:** the decoder reads frames at the video's native size, exactly as encoded. If a host re-encoded the video at a different resolution, the decoder reports a clear error instead of guessing — decode the original to recover the file.
+- **Color mode (`--color`):** besides the fast grayscale superset, the fork can embed truecolor data using an 8-corner RGB palette (black, red, green, blue, magenta, cyan, yellow, white) — 3 bits per $M \times M$ block, one independent threshold per channel. `M` must be even. The mode is self-describing: the decoder detects it from the embedded metadata.
 
 ## 🚀 Quick Start
 
@@ -33,13 +34,19 @@ python -m venv venv
 #### Encoding a file (CPU / libx264)
 
 ```bash
-./venv/bin/python VC7030_final_fixed.py encode <input_file> <M> <R> <width> <height> <processes> [--crf N]
+./venv/bin/python VC7030_color.py encode <input_file> <M> <R> <width> <height> <processes> [--crf N] [--color]
 ```
 
 Example (5 KB file, 16x16 blocks, 30x redundancy, 640x480, 4 workers):
 
 ```bash
-./venv/bin/python VC7030_final_fixed.py encode tiny_input.bin 16 30 640 480 4 --crf 23
+./venv/bin/python VC7030_color.py encode tiny_input.bin 16 30 640 480 4 --crf 23
+```
+
+Color mode (8-corner RGB palette, 3 bits/block, even `M` required):
+
+```bash
+./venv/bin/python VC7030_color.py encode tiny_input.bin 16 30 640 480 4 --crf 23 --color
 ```
 
 The encoded video is written to `encoded/encoded_video.mp4` relative to the working directory.
@@ -62,11 +69,11 @@ each other's output).
 #### Decoding
 
 ```bash
-./venv/bin/python VC7030_final_fixed.py decode <video_path> <processes>
+./venv/bin/python VC7030_color.py decode <video_path> <processes>
 ```
 
 ```bash
-./venv/bin/python VC7030_final_fixed.py decode encoded/encoded_video.mp4 4
+./venv/bin/python VC7030_color.py decode encoded/encoded_video.mp4 4
 ```
 
 Parameters are read from the embedded metadata, so no extra arguments are needed. The reconstructed file is written to `reconstructed/<original_filename>` relative to the working directory.

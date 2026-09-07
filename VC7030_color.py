@@ -2,6 +2,7 @@ import os
 import json
 import multiprocessing
 import argparse
+import sys
 import numpy as np
 from PIL import Image
 import logging
@@ -1033,16 +1034,17 @@ def _cleanup_decode(ffmpeg_process, reader_thread, stop_event, frame_queue):
         reader_thread.join(timeout=5)
 
 def _spawn_reader(video_path, width, height, pix_fmt='rgb24'):
-    """Start ffmpeg raw-frame extraction (resampled to width x height) plus the
-    reader thread. `pix_fmt` selects the raw layout: 'rgb24' (color data, H,W,3)
-    or 'gray' (1 channel, H,W — the fast path, identical to the original).
+    """Start ffmpeg raw-frame extraction at the video's NATIVE size plus the
+    reader thread. `width`/`height` must be the probed stream size: no
+    resampling is done, frames are read exactly as encoded, so block
+    boundaries stay bit-accurate. `pix_fmt` selects the raw layout: 'rgb24'
+    (color data, H,W,3) or 'gray' (1 channel, H,W — the fast path).
     Returns (ffmpeg_process, frame_queue, stop_event, reader_thread, frame_size)."""
     channels = COLOR_CHANNELS if pix_fmt == 'rgb24' else 1
     frame_size = width * height * channels
     ffmpeg_command = [
         'ffmpeg',
         '-i', video_path,
-        '-vf', f'scale={width}:{height}',
         '-f', 'rawvideo',
         '-pix_fmt', pix_fmt,
         '-v', 'error',
@@ -1130,7 +1132,8 @@ def decode_video_to_file(video_path, num_processes):
         frame_size = width * height
         logging.info(f"Video size: {width}x{height}, frame size: {frame_size} bytes")
 
-        # 2-3. Start ffmpeg + reader thread (resampled to the probe size).
+        # 2-3. Start ffmpeg + reader thread at the native stream size (no
+        # resampling — frames are read exactly as encoded).
         # Metadata frames are gray in BOTH modes (black/white blocks), so the
         # cheap 1-channel gray probe decodes them for gray and color streams
         # alike; the `color` flag in the embedded JSON then tells us whether
@@ -1152,86 +1155,20 @@ def decode_video_to_file(video_path, num_processes):
 
         meta = decode_meta_frames(meta_frames, width, height)
 
-        # 4b. Geometry realignment: the video may have been (re)encoded at a
-        # different size than the payload was embedded at (re-hosting,
-        # downscale). The block layout is geometry-bound, so rescan the
-        # metadata at candidate sizes until the embedded JSON parses.
-        # Candidates are the video size scaled by common re-hosting ratios and
-        # Candidates come in two forms, per re-hosting ratio:
-        #   * the EXACT product (width*f, height*f) — matches sources whose
-        #     size is NOT on the 16-block grid, e.g. 1080p (height 1080 is
-        #     67.5 blocks); the exact product lands on 1920x1080 cleanly;
-        #   * the same product SNAPPED to the 16-block grid (_to16) — absorbs
-        #     slightly inexact platform ratios, e.g. 426x240 * 3 = 1278 -> 1280.
-        # The metadata reader crops to the 16-grid itself, so a candidate need
-        # not be a multiple of 16 (only >= 16). The strict acceptance check
-        # (JSON parses AND its w/h == the probe size) rejects misaligned probes.
+        # 4b. Native-geometry check: this decoder reads frames exactly as
+        # encoded and performs NO resampling. The embedded metadata must
+        # describe the video's own size, otherwise the block grid is off and
+        # every bit would drift — a clean, explicit error beats a silent
+        # wrong file. (If the video was re-encoded by a platform at another
+        # resolution, decode it at the original instead.)
         if not (meta and meta.get('w') == width and meta.get('h') == height):
-            _cleanup_decode(ffmpeg_process, reader_thread, stop_event, frame_queue)
-            def _to16(n):
-                return max(16, int(round(n / 16.0)) * 16)
-            # most common re-hosting ratios first
-            factors = (1.5, 2.0, 4.0 / 3.0, 3.0, 4.0, 4.5, 6.0,
-                       8.0 / 3.0, 9.0 / 4.0, 16.0 / 5.0,
-                       2.25, 2.5, 3.5, 5.0, 1.75, 1.25, 0.5)
-            candidates = []
-            if meta and meta.get('w') and meta.get('h'):
-                candidates.append((int(meta['w']), int(meta['h'])))
-                candidates.append((_to16(meta['w']), _to16(meta['h'])))
-            # per factor: exact product first (off-grid sizes like 1080p),
-            # then the 16-snapped form (inexact platform ratios)
-            for factor in factors:
-                candidates.append((int(round(width * factor)),
-                                   int(round(height * factor))))
-                candidates.append((_to16(width * factor),
-                                   _to16(height * factor)))
-            seen = set()
-            ordered = []
-            for cw, ch in candidates:
-                if cw < 16 or ch < 16:
-                    continue
-                # skip absurdly large probes (no realistic source > 8K)
-                if cw > 8192 or ch > 8192:
-                    continue
-                if (cw, ch) == (width, height) or (cw, ch) in seen:
-                    continue
-                seen.add((cw, ch))
-                ordered.append((cw, ch))
-            for cw, ch in ordered:
-                logging.info(f"Geometry probe: rescan metadata at {cw}x{ch}")
-                # gray probe again: the metadata is gray in both modes.
-                (ffmpeg_process, frame_queue, stop_event,
-                 reader_thread, frame_size) = _spawn_reader(video_path, cw, ch,
-                                                            pix_fmt='gray')
-                mf = []
-                complete = True
-                for _ in range(R_META):
-                    try:
-                        fd = frame_queue.get(timeout=30)
-                    except Empty:
-                        complete = False
-                        break
-                    if len(fd) != frame_size:
-                        complete = False
-                        break
-                    mf.append(fd)
-                if not complete:
-                    _cleanup_decode(ffmpeg_process, reader_thread, stop_event, frame_queue)
-                    continue
-                cand_meta = decode_meta_frames(mf, cw, ch)
-                if cand_meta and cand_meta.get('w') == cw and cand_meta.get('h') == ch:
-                    meta = cand_meta
-                    width, height = cw, ch
-                    logging.info(f"Geometry realigned to {width}x{height}")
-                    break
-                _cleanup_decode(ffmpeg_process, reader_thread, stop_event, frame_queue)
-            if meta is None:
-                raise ValueError("Failed to decode metadata (video geometry may not match the embedded layout)")
-            if meta.get('w') != width or meta.get('h') != height:
-                raise ValueError(
-                    f"Metadata geometry {meta.get('w')}x{meta.get('h')} != video "
-                    f"{width}x{height}; no candidate layout matched"
-                )
+            raise ValueError(
+                f"metadata geometry {meta.get('w') if meta else '?'}x"
+                f"{meta.get('h') if meta else '?'} != video "
+                f"{width}x{height}: the video was re-encoded or rescaled "
+                f"after encoding; this decoder does not resample, so the "
+                f"file cannot be recovered from this copy"
+            )
 
         # 4b2. Color mode: the data frames are rgb24 (H, W, 3). The gray
         # reader above only served the metadata (gray in both modes); now
@@ -1586,6 +1523,7 @@ if __name__ == "__main__":
             print(f"Encoding completed successfully in {elapsed:.2f} sec")
         else:
             print("Encoding completed with errors")
+            sys.exit(1)
 
     elif args.mode == "decode":
         start_time = time.time()
@@ -1594,5 +1532,6 @@ if __name__ == "__main__":
             print(f"Decoding completed successfully in {elapsed:.2f} sec")
         else:
             print("Decoding completed with errors")
+            sys.exit(1)
     else:
         parser.print_help()
