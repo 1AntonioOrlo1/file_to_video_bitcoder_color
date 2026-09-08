@@ -68,7 +68,14 @@ def create_meta_image(meta_data, width, height, rgb=False):
         total_blocks = blocks_x * blocks_y
 
         if total_blocks < total_meta_bits:
-            raise ValueError(f"Metadata does not fit. Required: {total_meta_bits} bits, available: {total_blocks} blocks")
+            hint = ''
+            if 'gh' in meta_data:
+                hint = (' — with FEC the metadata carries the stream hash '
+                        'and k/m/pd/B keys, which need a larger canvas '
+                        '(720p or above); drop --fec-k or raise the size')
+            raise ValueError(f"Metadata does not fit. Required: "
+                             f"{total_meta_bits} bits, available: "
+                             f"{total_blocks} blocks{hint}")
 
         # Create an array of metadata bits
         bit_array = np.zeros(total_blocks, dtype=bool)
