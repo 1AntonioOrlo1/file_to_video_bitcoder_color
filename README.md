@@ -12,6 +12,7 @@ A fast and efficient tool for encoding files into video frames. This project is 
 - **Stall-safe decoding:** the decoder loop has a watchdog that aborts with a clear error instead of hanging when the frame stream ends unexpectedly; incomplete reconstructions are removed on failure.
 - **No resampling:** the decoder reads frames at the video's native size, exactly as encoded. If a host re-encoded the video at a different resolution, the decoder reports a clear error instead of guessing — decode the original to recover the file.
 - **Color mode (`--color`):** besides the fast grayscale superset, the fork can embed truecolor data using an 8-corner RGB palette (black, red, green, blue, magenta, cyan, yellow, white) — 3 bits per $M \times M$ block, one independent threshold per channel. `M` must be even. The mode is self-describing: the decoder detects it from the embedded metadata.
+- **FEC (`--fec-k`, `--fec-m`):** systematic MDS erasure coding (Cauchy over GF(256)) over whole frame groups. Recovers up to `m` lost groups per stripe of `k` data groups (any `k` of the `k+m` groups suffice). Works in **both grayscale and color modes** — the color path carries the 8-byte group header in the first 64 blocks (chroma-neutral) plus the payload at 3 bits/block. Geometry floor: FEC metadata is larger than plain metadata (it embeds the stream hash), so very small canvases (e.g. 640x360 with `M=16`) cannot hold it — the encoder raises a clear hint; 720p+ is fine.
 
 ## 🚀 Quick Start
 
@@ -47,6 +48,12 @@ Color mode (8-corner RGB palette, 3 bits/block, even `M` required):
 
 ```bash
 ./venv/bin/python VC7030_color.py encode tiny_input.bin 16 30 640 480 4 --crf 23 --color
+```
+
+Error-correcting mode (survives up to `m` lost frame groups per stripe of `k`; 720p+ recommended):
+
+```bash
+./venv/bin/python VC7030_color.py encode big_input.bin 8 4 1280 720 16 --crf 23 --fec-k 8 --fec-m 4 --color
 ```
 
 The encoded video is written to `encoded/encoded_video.mp4` relative to the working directory.
