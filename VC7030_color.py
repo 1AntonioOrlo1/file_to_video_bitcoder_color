@@ -326,13 +326,15 @@ def _read_group_payload(frame_idx, file_path, pd, group_bytes, total_bits):
 
 
 def _fec_group_frame(frame_idx, file_path, M, width, height, pd,
-                     group_bytes, k, P, df, total_bits):
+                     group_bytes, k, P, df, total_bits, color=False):
     """Render stream group `frame_idx` for an FEC stream.
 
     Stream layout per stripe (size k + m): k data groups, then m parity
     groups. A group is a data group iff its within-stripe index < k.
     Data groups read (and byte-align) their payload from the file; parity
     groups recompute their stripe's data payloads and encode over GF(256).
+    `color` selects the 3-bit (8-corner) group layout; gray is the 1-bit
+    one, byte-identical to the original program's render_payload.
     """
     m = P.shape[1]
     # The final stripe may be short (k_s < k): its stream stride is
@@ -364,10 +366,55 @@ def _fec_group_frame(frame_idx, file_path, M, width, height, pd,
         # 64 blocks; the decode-side packer uses it to verify placement and
         # detect/resync exact-group-boundary cuts.
         header = pack_header(frame_idx, payload)
+        if color:
+            return render_color_payload(payload, M, width, height,
+                                        header=header)
         return render_payload(payload, M, width, height, header=header)
     except ValueError as e:
         logging.error(f"FEC group {frame_idx} render failed: {e}")
         return None
+
+
+def render_color_payload(payload, M, width, height, header=None):
+    """Render a FEC group frame in COLOR mode (rgb24, 3 bits per block).
+
+    Layout: the 8-byte header is drawn in the first 64 blocks, each block
+    BLACK or WHITE on all three channels (bit h on R, G and B alike —
+    chroma-neutral, so x264's chroma averaging can never flip it). The
+    payload follows at 3 bits per block: bit 3b, 3b+1, 3b+2 drive R, G, B
+    of block b, MSB-first in the flat bitstream — exactly the
+    generate_color_frame / decode_color_frame convention. Trailing partial
+    blocks are zero-padded to black; the decoder reads exactly
+    len(payload) bytes, so the padding is never decoded.
+    """
+    blocks_x = width // M
+    blocks_y = height // M
+    total = blocks_x * blocks_y
+    if total < HEADER_BITS + 1:
+        raise ValueError(f"need >= {HEADER_BITS + 1} blocks for a color FEC "
+                         f"group (have {total})")
+    shift = np.array([7, 6, 5, 4, 3, 2, 1, 0], dtype=np.uint8)
+    # Header: 64 bits, each block b is (h_b, h_b, h_b) — black or white on
+    # all channels, interleaved per block like the rest of the stream.
+    hbits = ((np.frombuffer(header, dtype=np.uint8)[:, None] >> shift)
+             & 1).reshape(-1) if header else np.zeros(HEADER_BITS,
+                                                     dtype=bool)
+    hflat = np.tile(hbits.reshape(HEADER_BITS, 1), (1, 3)).reshape(-1)
+    # Payload bits, MSB-first, zero-padded to a whole block (multiple of 3).
+    raw = np.frombuffer(payload, dtype=np.uint8)
+    pbits = ((raw[:, None] >> shift) & 1).reshape(-1)
+    n_payload_blocks = len(pbits) // 3
+    pad = (3 - len(pbits) % 3) % 3
+    if pad:
+        pbits = np.concatenate([pbits, np.zeros(pad, dtype=bool)])
+    flat = np.concatenate([hflat, pbits[:3 * n_payload_blocks]])
+    full = np.zeros(total * 3, dtype=bool)
+    full[:len(flat)] = flat
+    matrix = full.reshape(blocks_y, blocks_x, 3)
+    expanded = matrix.repeat(M, axis=0).repeat(M, axis=1)
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    img[:blocks_y * M, :blocks_x * M] = expanded * 255
+    return img.tobytes()
 
 
 def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_bytes,
@@ -396,7 +443,7 @@ def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_by
             if k_fec > 0:
                 img = _fec_group_frame(frame_idx, file_path, M, width, height,
                                        pd, group_bytes, k_fec, P, df,
-                                       total_bits)
+                                       total_bits, color=color)
             elif color:
                 # 8-corner RGB palette, 3 file bits per block.
                 img = generate_color_frame(frame_idx, file_path, M, width, height,
@@ -454,14 +501,12 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
                           f"odd M would split yuv420p chroma samples across blocks")
             return False
 
-        # Color fork: the FEC group-header layout (render_payload / 8-byte
-        # header in the first 64 gray blocks) is gray-tuned and is not part of
-        # this fork. R-copy averaging already covers per-bit noise; FEC is the
-        # original program's territory.
-        if fec_k > 0 or fec_m > 0:
-            logging.error("Color fork: FEC is not supported (use the original "
-                          f"program for FEC streams; got --fec-k {fec_k} --fec-m {fec_m})")
-            return False
+        # FEC group frames are mode-dependent: gray draws the 8-byte header
+        # in the first 64 blocks (1 bit/block); color draws it in the first
+        # 64 blocks on ALL THREE channels (black/white, chroma-neutral) and
+        # carries 3 bits/block after block 64. Payload capacity per group
+        # frame is therefore (bits_per_frame - (3 if color else 1) * 64)
+        # bits, byte-aligned to B.
 
         file_size = os.path.getsize(file_path)
         filename = os.path.basename(file_path)
@@ -482,16 +527,17 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
 
         total_bits = file_size * 8
 
-        # --- (FEC disabled in this fork; see rejection above) ---
         use_fec = 0
         k_fec = m_fec = 0
-        B = max(0, (bits_per_frame - HEADER_BITS) // 8)
+        B = max(0, (bits_per_frame - (3 if color else 1) * HEADER_BITS) // 8)
         P = None
         n_data = 0
-        if fec_k > 0:  # unreachable: rejected above
+        if fec_k > 0:
             if B < 1:
-                logging.error(f"FEC needs >= {HEADER_BITS + 8} blocks/frame "
-                              f"(bits_per_frame={bits_per_frame}); use smaller M")
+                logging.error(f"FEC group payload is empty (B=0): "
+                              f"{n_blocks} blocks at M={M} cannot hold the "
+                              f"{HEADER_BITS}-block header plus a byte; "
+                              f"use a smaller M")
                 return False
             if fec_k + fec_m < 2 or fec_k + fec_m > 255:
                 logging.error(f"Invalid FEC stripe k+m={fec_k + fec_m} (need 2..255)")
@@ -832,12 +878,42 @@ def decode_fec_group(frames, M, R, width, height):
         return None
 
 
+def decode_fec_group_color(frames, M, R, width, height):
+    """Decode ONE stream group (R rgb24 copies) of a COLOR FEC stream.
+
+    Mirror of decode_fec_group for the 3-bit palette: the first 64 blocks
+    carry the 8-byte header (black/white on all channels), then B bytes of
+    payload at 3 bits/block. Returns (header8, payload_bytes) or None.
+    """
+    try:
+        bits_rgb, n_blocks = _color_from_frames(frames, M, R, width, height)
+        flat = bits_rgb.reshape(-1).astype(np.uint8)  # (3*n_blocks,)
+        n_payload_bytes = max(0, (3 * (n_blocks - HEADER_BITS)) // 8)
+        # Header: 64 bits from blocks 0..63 — all three channels were drawn
+        # identically (black/white); OR them so a single-channel smear still
+        # recovers the bit.
+        hdr_bits = flat[:3 * HEADER_BITS].reshape(HEADER_BITS, 3)
+        hdr_flat = np.zeros(64, dtype=np.uint8)
+        hdr_flat[:HEADER_BITS] = hdr_bits.any(axis=1).astype(np.uint8)
+        weights = np.array([128, 64, 32, 16, 8, 4, 2, 1], dtype=np.uint8)
+        header8 = (hdr_flat.reshape(-1, 8) * weights).sum(axis=1,
+                                                          dtype=np.uint8)
+        # Payload: blocks 64.., 3 bits each, MSB-first — B bytes = 8B bits.
+        pb = flat[3 * HEADER_BITS:3 * HEADER_BITS + 8 * n_payload_bytes]
+        payload = pb[:len(pb) // 8 * 8].reshape(-1, 8)
+        payload = (payload * weights).sum(axis=1, dtype=np.uint8).tobytes()
+        return (bytes(header8), payload)
+    except Exception as e:
+        logging.error(f"Error decoding color FEC group: {str(e)}")
+        return None
+
+
 
 
 
 def _fec_walk_groups(frame_queue, R, M, width, height, total_groups,
                      ffmpeg_process, reader_thread, stop_event, frame_size,
-                     n_threads=16):
+                     n_threads=16, color=False):
     """Yield (g, payload) for every intact group in an FEC stream.
 
     Steady state is aligned to group boundaries and whole R-frame windows
@@ -920,8 +996,9 @@ def _fec_walk_groups(frame_queue, R, M, width, height, total_groups,
             _fill(start + off + R)
             if base + len(buf) < start + off + R:
                 return None, None, None
-            res = decode_fec_group(buf[start + off - base:start + off - base + R],
-                                   M, R, width, height)
+            res = (decode_fec_group_color if color else decode_fec_group)(
+                buf[start + off - base:start + off - base + R],
+                M, R, width, height)
             ok = _check(res)
             if ok is not None:
                 return ok[0], ok[1], start + off + R
@@ -937,8 +1014,10 @@ def _fec_walk_groups(frame_queue, R, M, width, height, total_groups,
                 _fill(next_start + R)
                 if base + len(buf) < next_start + R:
                     break  # EOF: no full window left
+                _decoder = (decode_fec_group_color if color
+                            else decode_fec_group)
                 pending.append((next_start, pool.submit(
-                    decode_fec_group,
+                    _decoder,
                     buf[next_start - base:next_start - base + R],
                     M, R, width, height)))
             if not pending:
@@ -1240,7 +1319,7 @@ def decode_video_to_file(video_path, num_processes):
                     for g, payload in _fec_walk_groups(
                             frame_queue, R, M, width, height, total_groups,
                             ffmpeg_process, reader_thread, stop_event,
-                            frame_size):
+                            frame_size, color=bool(meta.get('color'))):
                         groups_q.put((g, payload))
                 except Exception as e:
                     logging.error(f"FEC walker error: {str(e)}")
