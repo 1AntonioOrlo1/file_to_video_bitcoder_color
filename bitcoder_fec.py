@@ -215,6 +215,33 @@ def crc_for_group(g, data_part):
     return zlib.crc32((g & 0xFFFF).to_bytes(2, 'big') + data_part) & 0xFFFFFFFF
 
 
+class SeqWrapTracker:
+    """Reconstruct true stream-group indices from the 16-bit header seq.
+
+    pack_header stores seq = g & 0xFFFF, so the field wraps every 65536
+    groups and the CRC (which covers the stored seq) verifies wrapped
+    groups as their wrapped identity. The stream itself is strictly
+    increasing in TRUE index, so in stream order the observed seq can only
+    jump FORWARD (a cut of whole groups) or FALL (a genuine wrap past
+    2**16). Each fall increments the wrap count; true index =
+    wraps * 2**16 + seq. Files past 65536 stream groups are therefore
+    recoverable; only a single gap that is an exact multiple of 65536
+    (already far beyond any m-erasure repair) would be ambiguous.
+    """
+
+    SEQ_MOD = 1 << 16
+
+    def __init__(self):
+        self._last = None
+        self._wraps = 0
+
+    def true_index(self, seq):
+        if self._last is not None and seq < self._last:
+            self._wraps += 1
+        self._last = seq
+        return self._wraps * self.SEQ_MOD + seq
+
+
 def bits64_to_bytes(bits):
     """First 64 bits (iterable of 0/1) -> 8 bytes, MSB-first."""
     b = 0

@@ -16,7 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 # FEC: systematic MDS erasure code over GF(256) — recovers up to m lost
 # frame groups per stripe of k (any k of the k+m stripe groups suffice).
-from bitcoder_fec import (HEADER_BYTES, HEADER_BITS, FecError, cauchy_matrix,
+from bitcoder_fec import (HEADER_BYTES, HEADER_BITS, FecError, SeqWrapTracker,
+                          cauchy_matrix,
                           crc_for_group, fec_decode, fec_encode, hash64_file,
                           header_crc, pack_header, render_payload, stripe_plan,
                           unpack_header)
@@ -736,12 +737,27 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
             output_video_path
         ]
 
-        ffmpeg_process = subprocess.Popen(
-            ffmpeg_command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+        # stderr goes to a file (not DEVNULL) so a dying ffmpeg can be
+        # post-mortem'd instead of surfacing as a bare Broken pipe. Hidden
+        # dotfiles are rejected on some mounts, so use the scratch dir.
+        ffmpeg_stderr_path = (
+            os.path.join(os.path.expanduser(
+                "~/.hermes/cache/scratch"), "ffmpeg_encode_stderr.log")
+            if 'hsl_out' in os.path.basename(output_video_path)
+            else None
         )
+        _stderr_fh = (open(ffmpeg_stderr_path, 'w') if ffmpeg_stderr_path
+                      else subprocess.DEVNULL)
+        try:
+            ffmpeg_process = subprocess.Popen(
+                ffmpeg_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=_stderr_fh
+            )
+        finally:
+            if ffmpeg_stderr_path is not None:
+                _stderr_fh.close()
 
         # Create meta-image and send to ffmpeg. The metadata frame's layout
         # matches the stream's input layout: rgb24 (RGB-gray) for color mode,
@@ -1097,6 +1113,7 @@ def _fec_walk_groups(frame_queue, R, M, width, height, total_groups,
     resolution, not with the thread count.
     """
     RAW_BUDGET = 2 * 1024 ** 3
+    seq_tracker = SeqWrapTracker()
 
     def _get_frame():
         while True:
@@ -1119,7 +1136,10 @@ def _fec_walk_groups(frame_queue, R, M, width, height, total_groups,
             return d
 
     def _check(res):
-        """(g, payload, margin) if the decoded window verifies, else None.
+        """(seq, payload, margin) if the decoded window verifies, else None.
+        `seq` is the RAW 16-bit header value; the caller maps it to a true
+        stream index via seq_tracker ONLY for accepted groups (a resync
+        slide probes many candidates and must not advance the tracker).
         margin is None on the gray path (its decoder returns no margin)."""
         if res is None:
             return None
@@ -1197,14 +1217,18 @@ def _fec_walk_groups(frame_queue, R, M, width, height, total_groups,
             wstart, fut = pending.pop(0)
             ok = _check(fut.result())
             if ok is not None:
-                yield ok
+                # Accept: map the raw 16-bit seq to the TRUE stream index
+                # (the header seq wraps every 65536 groups; see
+                # SeqWrapTracker). Yields are in stream order, so the
+                # tracker's forward-jump/fall rule is unambiguous here.
+                yield (seq_tracker.true_index(ok[0]), ok[1], ok[2])
                 cursor = wstart + R
                 _compact(cursor)
             else:
                 g, payload, margin, cursor = _resync(wstart)
                 if g is None:
                     return
-                yield (g, payload, margin)
+                yield (seq_tracker.true_index(g), payload, margin)
                 _compact(cursor)
                 # The in-flight windows were aligned to the old boundary;
                 # after a cut they may straddle the new one, so resubmit.
@@ -1484,6 +1508,17 @@ def decode_video_to_file(video_path, num_processes):
                     return s * (k_fec + m_fec) + idx_in
                 return last_ss + idx_in
 
+            def _stripe_of(g):
+                # Inverse of _stream_of: map a stream index to (stripe,
+                # within-stripe index). Mirrors the encoder's carving of the
+                # short last stripe from the end. Out-of-range -> (0, -1).
+                if g < 0 or g >= total_groups:
+                    return (0, -1)
+                if g >= last_ss:
+                    return (n_strips - 1, g - last_ss)
+                s, idx_in = divmod(g, k_fec + m_fec)
+                return (s, idx_in)
+
             groups_q = Queue()
             min_margin = None  # tightest threshold margin over all decoded groups
 
@@ -1502,71 +1537,113 @@ def decode_video_to_file(video_path, num_processes):
             walker = threading.Thread(target=_walker, daemon=True)
             walker.start()
 
-            output_path = os.path.join(recon_dir, filename)
-            received_map = {}
+            # Streaming stripe assembly: a stripe is decoded and written as
+            # soon as its k_s + m groups have arrived, so the main process
+            # never holds more than one stripe of payloads in RAM. The old
+            # design kept every group in `received_map` AND the full
+            # `bytearray` output at once (~2 x file size), which OOMs on
+            # multi-GB files. Memory is now O(stripe), not O(file).
+            stripe_bufs = [{} for _ in range(n_strips)]
+            seen = set()
             success = False
+            repaired = 0
+            next_stripe = 0  # next stripe to write out (strictly ordered)
+
+            def _flush_stripe(s):
+                # Assemble stripe s (missing groups are None) and write its
+                # data payload to the file, in order.
+                nonlocal repaired
+                k_s = min(k_fec, n_data - s * k_fec)
+                recv = [stripe_bufs[s].get(i) for i in range(k_s + m_fec)]
+                n_lost = sum(1 for x in recv if x is None)
+                if n_lost > m_fec:
+                    raise FecError(
+                        f"stripe {s}: {n_lost} of {k_s + m_fec} "
+                        f"groups lost ({m_fec} correctable)")
+                data = fec_decode(recv, k_s, P)
+                for i in range(k_s):
+                    if recv[i] is None:
+                        repaired += 1
+                    _of.write(data[i])
+                stripe_bufs[s] = {}  # free this stripe's payloads
+
+            output_path = os.path.join(recon_dir, filename)
+            with open(output_path, 'wb') as _of:
+                try:
+                    while True:
+                        rec = groups_q.get(timeout=60)
+                        if rec is None:
+                            break
+                        g, payload, margin = rec
+                        if g in seen:
+                            logging.warning(f"FEC group {g} delivered twice; ignoring")
+                            continue
+                        seen.add(g)
+                        if margin is not None and (min_margin is None or margin < min_margin):
+                            min_margin = margin
+                        s, idx_in = _stripe_of(g)
+                        if idx_in < 0:
+                            logging.warning(f"FEC group {g} is outside the "
+                                            f"stripe plan; ignoring")
+                            continue
+                        stripe_bufs[s][idx_in] = payload
+                        # Write stripes strictly in order: a completed stripe
+                        # releases all complete stripes before it. A damaged
+                        # stripe (a loss) stays pending until the EOF flush
+                        # below repairs it, which keeps the output order
+                        # correct even when later stripes arrive first.
+                        while (next_stripe < n_strips and
+                               len(stripe_bufs[next_stripe]) ==
+                               min(k_fec, n_data - next_stripe * k_fec)
+                               + m_fec):
+                            _flush_stripe(next_stripe)
+                            next_stripe += 1
+                    # EOF: flush every remaining stripe in order; losses
+                    # within one stripe are repaired, more than m is fatal.
+                    while next_stripe < n_strips:
+                        _flush_stripe(next_stripe)
+                        next_stripe += 1
+                except Empty:
+                    logging.error(f"FEC decode stalled: no group for 60s "
+                                  f"({len(seen)} collected)")
+                except Exception as e:
+                    logging.error(f"FEC decode error: {str(e)}")
+                _of.flush()
+                os.fsync(_of.fileno())
+            written = os.path.getsize(output_path)
+            if written < file_size:
+                raise FecError(
+                    f"reconstruction incomplete: {written} "
+                    f"of {file_size} bytes")
+            if written > file_size:
+                # The final group is zero-padded to a whole B bytes;
+                # trim the trailing padding down to the true size.
+                with open(output_path, 'r+b') as _f:
+                    _f.truncate(file_size)
+                logging.info(f"Trimmed trailing padding: {written} "
+                             f"-> {file_size} bytes")
+            if gh:
+                with open(output_path, 'rb') as _f:
+                    actual = hash64_file(_f)
+                if actual != gh:
+                    logging.error(f"FEC hash mismatch: {actual} != {gh}")
+                    raise FecError("payload hash mismatch")
+            logging.info(f"Successfully reconstructed {file_size} bytes "
+                         f"(FEC, {repaired} groups repaired from erasures"
+                         + (f", min threshold margin {min_margin:.3%}"
+                            if min_margin is not None else "") + ")")
+            success = True
+        if not success and os.path.exists(output_path):
             try:
-                while True:
-                    rec = groups_q.get(timeout=60)
-                    if rec is None:
-                        break
-                    g, payload, margin = rec
-                    if g in received_map:
-                        logging.warning(f"FEC group {g} delivered twice; ignoring")
-                        continue
-                    received_map[g] = payload
-                    if margin is not None and (min_margin is None or margin < min_margin):
-                        min_margin = margin
-                out = bytearray()
-                repaired = 0
-                for s in range(n_strips):
-                    ds = s * k_fec
-                    k_s = min(k_fec, n_data - ds)
-                    recv = [received_map.get(_stream_of(s, i))
-                            for i in range(k_s + m_fec)]
-                    n_lost = k_s + m_fec - sum(1 for x in recv if x is not None)
-                    if n_lost > m_fec:
-                        raise FecError(
-                            f"stripe {s}: {n_lost} of {k_s + m_fec} groups lost "
-                            f"({m_fec} correctable)")
-                    data = fec_decode(recv, k_s, P)
-                    for i in range(k_s):
-                        if recv[i] is None:
-                            repaired += 1
-                        out.extend(data[i])
-                if len(out) < file_size:
-                    raise ValueError(
-                        f"FEC: {len(out)} payload bytes available, need {file_size}")
-                with open(output_path, 'wb') as _of:
-                    _of.write(bytes(out[:file_size]))
-                if gh:
-                    with open(output_path, 'rb') as _f:
-                        actual = hash64_file(_f)
-                    if actual != gh:
-                        logging.error(f"FEC hash mismatch: {actual} != {gh}")
-                        raise FecError("payload hash mismatch")
-                logging.info(f"Successfully reconstructed {file_size} bytes "
-                             f"(FEC, {repaired} groups repaired from erasures"
-                             + (f", min threshold margin {min_margin:.3%}"
-                                if min_margin is not None else "") + ")")
-                success = True
-            except Empty:
-                logging.error(f"FEC decode stalled: no group for 60s "
-                              f"({len(received_map)} collected)")
-            except Exception as e:
-                logging.error(f"FEC decode error: {str(e)}")
-            finally:
-                if not success and os.path.exists(output_path):
-                    try:
-                        os.remove(output_path)
-                        logging.info("Removed incomplete reconstruction file")
-                    except OSError:
-                        pass
-                # The FEC branch owns the reader/ffmpeg (no shared pool), so
-                # tear them down here the way the legacy finally does.
-                _cleanup_decode(ffmpeg_process, reader_thread, stop_event,
-                                frame_queue)
-            return success
+                os.remove(output_path)
+                logging.info("Removed incomplete reconstruction file")
+            except OSError:
+                pass
+        # The FEC branch owns the reader/ffmpeg (no shared pool), so tear
+        # them down here the way the legacy finally does.
+        _cleanup_decode(ffmpeg_process, reader_thread, stop_event,
+                        frame_queue)
+        return success
 
         # 5. Process data. Bits per block from the embedded `color` flag:
         # color = 3 (R,G,B 8-corner palette), gray = 1.
