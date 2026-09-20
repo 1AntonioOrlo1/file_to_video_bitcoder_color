@@ -18,6 +18,7 @@ maximum-density pipeline.
 
 | Tool | Where the data lives | Capacity | Survives re-encode | Self-repair (FEC) |
 |---|---|---|---|---|
+| [fvid](https://github.com/AlfredoSequeida/fvid) | 1-bit pixel frames (this project's ancestor) | 1 bit/px, no FEC | partially — threshold decoding survives mild re-compression, but any lost frame is unrecoverable | no |
 | [OpenPuff](https://en.wikipedia.org/wiki/OpenPuff) | MP4 *container* (null-space of metadata) | MB-scale | no — any re-mux/re-encode destroys it | no |
 | [videostego](https://github.com/JavDomGom/videostego) | MP4 container bits | KB–MB | no | no |
 | [TwoPixels](https://github.com/anandbaburajan/TwoPixels), [Video-Steganography (LSB)](https://github.com/itxKAE/Video-Steganography) | pixel LSB of real footage | low (imperceptibility-first) | no — CRF 23 already flips LSBs | no |
@@ -78,6 +79,54 @@ cd file_to_video_bitcoder_color
 python -m venv venv
 ./venv/bin/pip install -r requirements.txt
 ```
+
+### Recommended recipes (1080p / 4K)
+
+The measured-best recipe for both geometries is the same: **color mode,
+M=8, k=127/m=2 FEC, veryslow preset** — `--auto` picks exactly that.
+`--auto` (R=2) is the default: ~24% larger than the absolute-densest
+variant but keeps copy-averaging for platform re-encode robustness.
+`--auto --max-dense` (R=1) is the smallest video and still repairs up to
+2 whole-group losses per stripe — use it for files that will not be
+re-encoded again (local HDD → same machine).
+
+**1080p (1920×1080)** — ~6 MB of video per 2 MB of payload:
+
+```bash
+# balanced (default): ~6 MB out per 2 MB in
+./venv/bin/python VC7030_color.py encode my_file.bin 0 0 1920 1080 8 --color --auto
+# densest: ~5.6 MB out per 2 MB in
+./venv/bin/python VC7030_color.py encode my_file.bin 0 0 1920 1080 8 --color --auto --max-dense
+```
+
+**4K (3840×2160)** — same recipe, same density (stream volume is
+`~filesize·R·M²`, resolution-independent); the bigger canvas just fits
+more blocks per frame:
+
+```bash
+./venv/bin/python VC7030_color.py encode my_file.bin 0 0 3840 2160 8 --color --auto
+./venv/bin/python VC7030_color.py encode my_file.bin 0 0 3840 2160 8 --color --auto --max-dense
+```
+
+Decode is always the same two commands — parameters come from the
+embedded metadata, no flags needed:
+
+```bash
+./venv/bin/python VC7030_color.py decode encoded/encoded_video.mp4 16
+# result: reconstructed/<original_filename>
+```
+
+Notes:
+
+- **PROCESSES** = worker count (8 is the tested default; match your core
+  count).
+- **4K memory:** the frame pool is resolution-dependent — a multi-GB
+  4K encode peaks at several GB of RAM. On a tight machine (or next to
+  a GPU LLM server), stop the other consumer or use 1080p; the payload
+  size of the output is the same either way.
+- **Large files:** 1080p is the sweet spot for multi-GB payloads — a
+  6.94 GB file encoded in ~3 h and decoded byte-exact (verified).
+  `--max-dense` halves the encode time vs `--auto` (R=1 vs R=2).
 
 ### CLI
 
