@@ -1,12 +1,12 @@
-# bitcoder — hide any file inside an MP4 video (video steganography with error correction)
+# file to video bitcoder — hide any file inside an MP4 video (video steganography with error correction)
 
-**bitcoder** is a Python + FFmpeg tool for **video steganography**: it embeds an
-arbitrary file (a PNG, a zip, a video, a database — anything, up to gigabytes)
-into a standard, playable **H.264/MP4** video, and extracts it back
-**byte-exact** (SHA-256 verified). Unlike most steganography tools it survives
-lossy compression and can **repair lost or corrupted segments** with forward
-error correction (FEC) — no retransmission, no password exchange, no container
-metadata tricks.
+**file to video bitcoder** (color fork) is a Python + FFmpeg tool for **video
+steganography**: it embeds an arbitrary file (a PNG, a zip, a video, a
+database — anything, up to gigabytes) into a standard, playable **H.264/MP4**
+video, and extracts it back **byte-exact** (SHA-256 verified). Unlike most
+steganography tools it survives lossy compression and can **repair lost or
+corrupted segments** with forward error correction (FEC) — no retransmission,
+no password exchange, no container metadata tricks.
 
 A fork of [1AntonioOrlo1/file_to_video_bitcoder](https://github.com/1AntonioOrlo1/file_to_video_bitcoder),
 itself an analog of [fvid](https://github.com/AlfredoSequeida/fvid). This fork
@@ -18,24 +18,45 @@ maximum-density pipeline.
 
 | Tool | Where the data lives | Capacity | Survives re-encode | Self-repair (FEC) |
 |---|---|---|---|---|
-| [fvid](https://github.com/AlfredoSequeida/fvid) | 1-bit pixel frames (this project's ancestor) | 1 bit/px, no FEC | partially — threshold decoding survives mild re-compression, but any lost frame is unrecoverable | no |
+| [fvid](https://github.com/AlfredoSequeida/fvid) | 1-bit pixel frames (this project's ancestor) | 1 bit/px | partially — threshold decoding survives mild re-compression, but any lost frame is unrecoverable | no |
+| [bin2video](https://github.com/pixelomer/bin2video) | raw binary → video frames (C, 1–24 bits/pixel) | high | no — no ECC, frame loss = data loss | no |
+| [file-to-video](https://github.com/oyetanishq/file-to-video) | binary video frames (C++) | high | no | no |
+| [UltraStore](https://github.com/Akul-af/UltraStore) | lossless **FFV1/MKV** stream | high (archival) | yes by construction (FFV1 lossless) — but a cut/dropped frame is still unrecoverable | no |
+| [yts3](https://github.com/freddiev4/yts3) | lossless FFV1/MKV via DCT steganography (Rust) | high, tuned for **YouTube as storage** | yes — lossless container; no per-frame redundancy | no |
+| [Infinite Storage Glitch](https://github.com/4A49/Infinite-Storage-Glitch) / [InfinityVault](https://github.com/thebitanpaul/InfinityVault) | file → binary → MP4 → file | high | no | no |
+| [yt-media-storage](https://github.com/PulseBeat02/yt-media-storage) | uploadable media (GUI + batch) | high | no | no |
+| [mp4modem](https://github.com/grmchn/mp4modem) | visible H.264/MP4 stream | medium | yes — designed to survive compatible transcoding | no |
+| [qrstream-enhanced](https://github.com/ddddavid-he/qrstream-enhanced) | QR-code video | medium | yes — **RaptorQ/LT fountain codes** recover from lost frames | **yes (fountain codes)** |
+| [Bit2Vid](https://github.com/nuan-cmyk/Bit2Vid) | binary → MP4, AES-256-GCM + Reed–Solomon | medium | yes — RS ECC repairs damaged blocks | **yes (Reed–Solomon)** |
+| [TexelDB](https://github.com/iamrknain/TexelDB) | images/frames → GIF (visual data storage) | medium | no | no |
+| Pixel Video Encoder/Decoder | AVI/PNG frames | medium | no | no |
 | [OpenPuff](https://en.wikipedia.org/wiki/OpenPuff) | MP4 *container* (null-space of metadata) | MB-scale | no — any re-mux/re-encode destroys it | no |
 | [videostego](https://github.com/JavDomGom/videostego) | MP4 container bits | KB–MB | no | no |
 | [TwoPixels](https://github.com/anandbaburajan/TwoPixels), [Video-Steganography (LSB)](https://github.com/itxKAE/Video-Steganography) | pixel LSB of real footage | low (imperceptibility-first) | no — CRF 23 already flips LSBs | no |
 | [video-in-video](https://github.com/Amritaryal44/Video-Steganography), [StegoVideoDemo](https://github.com/mightymoogle/StegoVideoDemo) | raw pixel overwrite | high | no — lossy compression corrupts it | no (watermarking focus) |
-| **bitcoder (this)** | **pixel blocks of a noise video** | **~⅓ of the video's bytes are payload** (2 MB → ~6 MB) | **yes — CRF-23 H.264 roundtrip, byte-exact** | **yes — MDS GF(256), repairs ≤m groups per stripe** |
+| **file to video bitcoder (this)** | **pixel blocks of a noise video** | **~⅓ of the video's bytes are payload** (2 MB → ~6 MB) | **yes — CRF-23 H.264 roundtrip, byte-exact, verified on 6.94 GB** | **yes — MDS GF(256), repairs ≤m groups per stripe** |
 
 Container-level tools (OpenPuff, videostego) hide bytes in the MP4 file
 structure — clever, but a single re-mux or platform re-encode destroys the
 payload, and published research (e.g. *"Steganalysis of OpenPuff through atomic
 concatenation of MP4 flags"*) already describes how to detect them.
 Imperceptibility-first pixel-LSB tools keep real footage looking natural, but
-their payload is a few kilobytes and any lossy re-encode flips it. bitcoder
-trades naturalness for **capacity + robustness**: the cover video is TV
-static, but it carries hundreds of times more data, round-trips through
-platform compression **bit-perfect**, and can even heal cut/lost segments.
-Use it when you need to *move* data, not when the footage must stay
-recognizable.
+their payload is a few kilobytes and any lossy re-encode flips it.
+The plain **file-to-video** family (bin2video, file-to-video,
+Infinite-Storage-Glitch, …) solves the transport problem but has no
+redundancy at all: one dropped or reordered frame corrupts everything after
+it, and the lossless-FFV1 variants (UltraStore, yts3) trade a very large
+container for zero resilience to cuts. The ECC-equipped tools (Bit2Vid's
+Reed–Solomon, qrstream-enhanced's fountain codes) are the closest in spirit —
+file-to-video bitcoder goes further: the payload survives a **lossy H.264
+re-encode** (the standard YouTube/cloud path) **and** repairs up to `m`
+whole-group erasures per stripe with MDS coding over GF(256), verified
+byte-exact on a 6.94 GB file.
+bitcoder trades naturalness for **capacity + robustness**: the cover video is
+TV static, but it carries hundreds of times more data than LSB tools,
+round-trips through platform compression **bit-perfect**, and can even heal
+cut/lost segments. Use it when you need to *move* data, not when the footage
+must stay recognizable.
 
 ## ✨ Features
 
