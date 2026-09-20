@@ -175,13 +175,20 @@ SPARE = 0x55
 
 
 def pack_header(g, data_part):
-    """8-byte header for stream group g over its data_part bytes."""
+    """8-byte header for stream group g over its data_part bytes.
+
+    The CRC covers the SEQUENCE FIELD as well as the payload. At small M or
+    small R a seq bit can survive compression: the header then still
+    verifies against its own payload and would be filed under the WRONG
+    group index — and because first delivery wins, it would displace the
+    real owner of that index and hand a corrupt survivor to the MDS
+    assembler (the final hash check would then fail a stripe that was
+    repairable). Tying the CRC to seq turns any seq damage into a plain
+    erasure, which the MDS code repairs as usual."""
     import zlib
-    crc = zlib.crc32(data_part) & 0xFFFFFFFF
-    return (bytes([MAGIC])
-            + ((g & 0xFFFF)).to_bytes(2, 'big')
-            + crc.to_bytes(4, 'big')
-            + bytes([SPARE]))
+    seq = (g & 0xFFFF).to_bytes(2, 'big')
+    crc = zlib.crc32(seq + data_part) & 0xFFFFFFFF
+    return (bytes([MAGIC]) + seq + crc.to_bytes(4, 'big') + bytes([SPARE]))
 
 
 def unpack_header(h8):
@@ -198,6 +205,14 @@ def unpack_header(h8):
 
 def header_crc(h8):
     return int.from_bytes(h8[3:7], 'big')
+
+
+def crc_for_group(g, data_part):
+    """The CRC a valid header for group g over data_part carries (seq field
+    XOR-folded in — see pack_header). Decode-side verification must use this
+    (not a bare crc32(payload)) or every group fails after the seq tie-in."""
+    import zlib
+    return zlib.crc32((g & 0xFFFF).to_bytes(2, 'big') + data_part) & 0xFFFFFFFF
 
 
 def bits64_to_bytes(bits):

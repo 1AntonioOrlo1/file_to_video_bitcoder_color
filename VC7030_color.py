@@ -17,8 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 # FEC: systematic MDS erasure code over GF(256) — recovers up to m lost
 # frame groups per stripe of k (any k of the k+m stripe groups suffice).
 from bitcoder_fec import (HEADER_BYTES, HEADER_BITS, FecError, cauchy_matrix,
-                          fec_decode, fec_encode, hash64_file, header_crc,
-                          pack_header, render_payload, stripe_plan,
+                          crc_for_group, fec_decode, fec_encode, hash64_file,
+                          header_crc, pack_header, render_payload, stripe_plan,
                           unpack_header)
 
 # Logging setup
@@ -26,7 +26,81 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Constants
 M_META = 16
+M_META_MIN = 4  # adaptive meta canvas: the block can shrink down to this
 R_META = 30  # Number of metadata copies
+
+# Recommended color+FEC recipes per typical YouTube geometry, chosen by
+# benchmark (run_profiles.py + run_sweep.py, 2 MB real PNG payload, CRF 23,
+# k=8): (M, R, k, m). k/m are only applied when the user did not pass
+# explicit --fec-k/--fec-m.
+#
+# The winner is M=8 at every geometry, and the mp4 size is nearly the SAME
+# at 720p / 1080p / 4K (~13-18 MB for a 2 MB file) because the stream
+# volume is ~filesize * R * M^2 — independent of resolution. M=8 lands its
+# block edges on x264's 8x8 DCT grid, so a solid white 0/255 block encodes
+# in ~1 bit; a misaligned M (6/10/12) smears the hard edge across DCT
+# blocks and costs 4-6x in bitrate.
+#
+# The default below is R=2: it is ~24% denser than the old R=4 recipe while
+# keeping some copy-averaging for robustness against a platform re-encode,
+# and the m=2 parity groups repair up to 2 lost/corrupt groups per stripe.
+# Because M=8 is DCT-aligned, even R=1 keeps the threshold margin at ~75%
+# (compression flips no bits), so the DENSITY_PROFILES_MAX entry is the
+# absolute-densest option — R=1 m=1 (~11.6 MB) — where every group failure
+# (a whole-group loss OR a bit-flipped frame) shows up as a failed CRC and
+# is repaired as an erasure, as long as <=m per stripe. Raising m trades
+# ~12.5% size for more erasure tolerance; raising R trades size for margin.
+#
+# The 5th element is the x264 preset the auto mode uses when the user did
+# not pass --preset. The measured winners (2 MB PNG, CRF 23, 1080p):
+#   color  R=1: medium 12 MB / slow 10 MB / veryslow 6 MB (2.7x slower)
+#   gray   R=2: medium  6 MB / veryslow 5 MB (3.7x slower)
+# Color frames are a regular flat 0/255 DCT-aligned pattern, so a slow
+# preset with a big lookahead compresses them ~2x denser — that is why
+# color auto picks veryslow. Gray patterns are less regular (1 bit/block),
+# so veryslow saves only ~17% and medium stays the balance.
+#
+# The stripe is k=127 (the GF(256) Cauchy cap for m=2: 2k+m-2 <= 255).
+# run_ksweep.py measured the parity overhead: k=8 = 25.6% of groups,
+# k=64 = 3.7%, k=127 = 2.4%. One long stripe covers almost the whole file
+# (164 data groups here), so losses in *different places* are repaired
+# too, not just adjacent pairs — and m=2 costs only ~1.3% over m=1 at this
+# k, so the double protection is nearly free. Sizes (2 MB, veryslow):
+#   R=2 k=127 m=2 = 6.0 MB (was 7.25 at k=8)
+#   R=1 k=127 m=2 = 5.6 MB (was 6.73 at k=8)
+DENSITY_PROFILES = {
+    (1280, 720):  (8, 2, 127, 2, 'veryslow'),
+    (1920, 1080): (8, 2, 127, 2, 'veryslow'),
+    (3840, 2160): (8, 2, 127, 2, 'veryslow'),
+}
+# Absolute-densest option (minimum size, thinnest protection) — use it when
+# the file will not be bounced through many re-encodes and the transport is
+# mostly drops/cuts (whole-group erasures), which m=2 still repairs.
+DENSITY_PROFILES_MAX = {
+    (1280, 720):  (8, 1, 127, 2, 'veryslow'),
+    (1920, 1080): (8, 1, 127, 2, 'veryslow'),
+    (3840, 2160): (8, 1, 127, 2, 'veryslow'),
+}
+
+
+def resolve_profile(width, height, table=None):
+    """Look up the density recipe for (width, height).
+
+    Exact geometry first; otherwise the nearest profile by pixel count
+    (an approximation for non-standard sizes — the margin measured in the
+    benchmark still bounds it, since the recipe's M is even and the
+    canvas is a superset of the tested one). Returns None if the table is
+    empty. `table` selects DENSITY_PROFILES (default, R=2 balance) or
+    DENSITY_PROFILES_MAX (R=1, absolute-densest)."""
+    if table is None:
+        table = DENSITY_PROFILES
+    if not table:
+        return None
+    if (width, height) in table:
+        return table[(width, height)]
+    target = width * height
+    return min(table.items(),
+               key=lambda kv: abs(kv[0][0] * kv[0][1] - target))[1]
 
 def get_output_directory():
     directory = os.path.join(os.getcwd(), 'encoded')
@@ -38,7 +112,26 @@ def get_reconstructed_directory():
     os.makedirs(directory, exist_ok=True)
     return directory
 
-def create_meta_image(meta_data, width, height, rgb=False):
+def meta_block_size(width, height, meta_bits):
+    """Largest even meta block in [M_META_MIN, M_META] whose canvas holds
+    `meta_bits` (with a 10% safety margin, so a near-full canvas cannot
+    round a borderline block the wrong way). Returns None when even
+    M_META_MIN does not fit.
+
+    A grid holds (w//b)*(h//b) blocks, so a SMALLER block gives MORE of
+    them. The fixed-M_META=16 canvas is only 880 blocks at 640x360 while
+    the FEC metadata needs ~1300 bits — so the block shrinks (16 -> 8)
+    until it fits, lifting the old 720p+ geometry floor. The chosen size
+    is stored in the metadata ('mb') and the decoder probes the same
+    candidate list when M_META alone does not parse."""
+    need = int(meta_bits * 1.1)
+    for b in range(M_META, M_META_MIN - 1, -2):
+        if (width // b) * (height // b) >= need:
+            return b
+    return None
+
+
+def create_meta_image(meta_data, width, height, rgb=False, block=None):
     try:
         # Minimal metadata
         minimal_meta = {
@@ -62,12 +155,15 @@ def create_meta_image(meta_data, width, height, rgb=False):
         meta_bytes = meta_json.encode('utf-8')
         total_meta_bits = len(meta_bytes) * 8
 
-        # Calculate only whole blocks
-        blocks_x = width // M_META
-        blocks_y = height // M_META
-        total_blocks = blocks_x * blocks_y
-
-        if total_blocks < total_meta_bits:
+        # Calculate only whole blocks. The block size adapts down from
+        # M_META when the canvas is too small for the metadata (small
+        # geometry + the larger FEC metadata): a smaller block gives more
+        # blocks. The chosen size rides in the JSON as 'mb' (legacy
+        # decoders ignore unknown keys; modern decoders read it back).
+        meta_block = block
+        if meta_block is None:
+            meta_block = meta_block_size(width, height, total_meta_bits)
+        if meta_block is None:
             hint = ''
             if 'gh' in meta_data:
                 hint = (' — with FEC the metadata carries the stream hash '
@@ -75,7 +171,24 @@ def create_meta_image(meta_data, width, height, rgb=False):
                         '(720p or above); drop --fec-k or raise the size')
             raise ValueError(f"Metadata does not fit. Required: "
                              f"{total_meta_bits} bits, available: "
-                             f"{total_blocks} blocks{hint}")
+                             f"{(width // M_META_MIN) * (height // M_META_MIN)} "
+                             f"blocks at the smallest block ({M_META_MIN}){hint}")
+
+        # The 'mb' key grows the JSON a few bytes; the 10% canvas margin
+        # in meta_block_size covers it. Recompute so the embedded bytes are
+        # the ones actually drawn.
+        minimal_meta['mb'] = meta_block
+        meta_json = json.dumps(minimal_meta, separators=(',', ':'))
+        meta_bytes = meta_json.encode('utf-8')
+        total_meta_bits = len(meta_bytes) * 8
+
+        blocks_x = width // meta_block
+        blocks_y = height // meta_block
+        total_blocks = blocks_x * blocks_y
+
+        if total_blocks < total_meta_bits:
+            raise ValueError(f"Metadata does not fit. Required: "
+                             f"{total_meta_bits} bits, available: {total_blocks} blocks")
 
         # Create an array of metadata bits
         bit_array = np.zeros(total_blocks, dtype=bool)
@@ -89,8 +202,8 @@ def create_meta_image(meta_data, width, height, rgb=False):
         # Convert to 2D block matrix
         bit_matrix = bit_array[:blocks_x*blocks_y].reshape(blocks_y, blocks_x)
 
-        # Expand each bit to an M_META x M_META block
-        expanded = bit_matrix.repeat(M_META, axis=0).repeat(M_META, axis=1)
+        # Expand each bit to a meta_block x meta_block block
+        expanded = bit_matrix.repeat(meta_block, axis=0).repeat(meta_block, axis=1)
 
         if rgb:
             # The stream is rgb24 (color mode), so the metadata frame is
@@ -98,12 +211,12 @@ def create_meta_image(meta_data, width, height, rgb=False):
             # All three channels carry the same bit, so a per-channel
             # threshold in decode_meta_frames recovers it exactly.
             full = np.zeros((height, width, 3), dtype=np.uint8)
-            full[:blocks_y*M_META, :blocks_x*M_META] = expanded[..., None] * 255
+            full[:blocks_y*meta_block, :blocks_x*meta_block] = expanded[..., None] * 255
             return Image.fromarray(full, mode='RGB')
 
         # Create full image
         full_image = np.zeros((height, width), dtype=bool)
-        full_image[:blocks_y*M_META, :blocks_x*M_META] = expanded
+        full_image[:blocks_y*meta_block, :blocks_x*meta_block] = expanded
 
         # Convert to PIL image
         img = Image.fromarray(full_image)
@@ -252,8 +365,12 @@ def _color_from_frames(frames, M, R, width, height):
         b = arr[:cropped_height, :cropped_width].reshape(blocks_y, M, blocks_x, M, 3)
         acc += b.sum(axis=(1, 3), dtype=np.int64)
     thr = 128 * R * M * M
+    # Relative margin per block-channel: |acc - thr| / thr. The minimum
+    # over the whole frame is how close the worst block sits to its
+    # threshold — the headroom left before compression flips a bit.
+    margin = float(np.min(np.abs(acc - thr)) / thr)
     bits_rgb = (acc >= thr)
-    return bits_rgb, blocks_x * blocks_y
+    return bits_rgb, blocks_x * blocks_y, margin
 
 
 def decode_color_frame(frames, M, R, width, height, frame_idx, meta):
@@ -264,7 +381,7 @@ def decode_color_frame(frames, M, R, width, height, frame_idx, meta):
     bytes, emitting only this frame's real bytes (final partial frame).
     """
     try:
-        bits_rgb, n_blocks = _color_from_frames(frames, M, R, width, height)
+        bits_rgb, n_blocks, _ = _color_from_frames(frames, M, R, width, height)
         total_slots = 3 * n_blocks
         start_bit = frame_idx * total_slots
         end_bit = min(start_bit + total_slots, meta['tb'])
@@ -318,21 +435,21 @@ def _close_pool(shm):
         pass
 
 
-def _read_group_payload(frame_idx, file_path, pd, group_bytes, total_bits):
+def _read_group_payload(fh, frame_idx, pd, group_bytes, total_bits):
     """Byte-aligned payload of data group `frame_idx`: exactly group_bytes
     bytes (the last group is zero-padded to a full byte count so that every
     row of a stripe has the same length — GF(256) operates on equal-length
-    byte vectors)."""
+    byte vectors). `fh` is a seekable binary file handle opened once per
+    worker (the old per-call open() cost a syscall pair per group)."""
     start_bit = frame_idx * pd  # pd is a multiple of 8, so this is byte-aligned
     end_bit = min(start_bit + pd, total_bits)
     n_bytes = max(0, (end_bit + 7) // 8 - start_bit // 8)
-    with open(file_path, 'rb') as f:
-        f.seek(start_bit // 8)
-        chunk = f.read(n_bytes)
+    fh.seek(start_bit // 8)
+    chunk = fh.read(n_bytes)
     return chunk.ljust(group_bytes, b'\x00')
 
 
-def _fec_group_frame(frame_idx, file_path, M, width, height, pd,
+def _fec_group_frame(fh, frame_idx, M, width, height, pd,
                      group_bytes, k, P, df, total_bits, color=False):
     """Render stream group `frame_idx` for an FEC stream.
 
@@ -357,11 +474,11 @@ def _fec_group_frame(frame_idx, file_path, M, width, height, pd,
     ds = s * k
     k_s = min(k, df - ds)  # data groups in this stripe (last may be short)
     if idx_in < k_s:
-        payload = _read_group_payload(ds + idx_in, file_path, pd,
+        payload = _read_group_payload(fh, ds + idx_in, pd,
                                       group_bytes, total_bits)
     else:
-        data = np.stack([np.frombuffer(_read_group_payload(ds + i, file_path,
-                                                           pd, group_bytes,
+        data = np.stack([np.frombuffer(_read_group_payload(fh, ds + i, pd,
+                                                           group_bytes,
                                                            total_bits),
                                        dtype=np.uint8)
                          for i in range(k_s)])
@@ -437,9 +554,13 @@ def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_by
     data group or recomputes its parity group from the stripe's data
     payloads read back from the file."""
     shm = None
+    fh = None
     try:
         shm = SharedMemory(name=pool_name)
         mv = memoryview(shm.buf)
+        # One seekable handle for the whole worker's life: the old code
+        # open()/close()d the file inside every group read.
+        fh = open(file_path, 'rb')
         while True:
             try:
                 frame_idx = task_queue.get(timeout=1)
@@ -448,7 +569,7 @@ def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_by
             if frame_idx is None:
                 break
             if k_fec > 0:
-                img = _fec_group_frame(frame_idx, file_path, M, width, height,
+                img = _fec_group_frame(fh, frame_idx, M, width, height,
                                        pd, group_bytes, k_fec, P, df,
                                        total_bits, color=color)
             elif color:
@@ -469,6 +590,11 @@ def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_by
     except Exception as e:
         logging.error(f"Error in worker process: {str(e)}")
     finally:
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
         if shm is not None:
             try:
                 shm.close()
@@ -548,6 +674,14 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
                 return False
             if fec_k + fec_m < 2 or fec_k + fec_m > 255:
                 logging.error(f"Invalid FEC stripe k+m={fec_k + fec_m} (need 2..255)")
+                return False
+            # GF(256) Cauchy cap: P[i][j]=1/(x_i+y_j) with x_i=i, y_j=k+j
+            # yields field elements up to 2k+m-2, which must fit in GF(256).
+            if 2 * fec_k + fec_m - 2 > 255:
+                logging.error(
+                    f"FEC stripe k={fec_k} m={fec_m} exceeds the GF(256) "
+                    f"Cauchy cap (2k+m-2={2 * fec_k + fec_m - 2} > 255); "
+                    f"max k for m={fec_m} is {(256 - fec_m) // 2}")
                 return False
             use_fec = 1
             k_fec, m_fec = fec_k, fec_m
@@ -637,6 +771,11 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
         # Frame bytes per pixel: 3 (rgb24, color mode) or 1 (gray, B/W mode).
         ch_per_px = COLOR_CHANNELS if color else 1
         frame_size = width * height * ch_per_px
+        # Pool depth: one slot per worker is the minimum that keeps the
+        # dispatch window from deadlocking the semaphore (frame f and
+        # frame f+pool_n share slot f%pool_n; the window ensures f+pool_n
+        # is not dispatched until f has been written and released).
+        # Deeper pools would use more /dev/shm without adding parallelism.
         pool_n = max(num_processes, 2)
         pool_name, pool_shm, pool_buf, pool_sems = _make_frame_pool(pool_n, frame_size)
 
@@ -734,12 +873,35 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
         return False
 
 def decode_meta_frames(meta_frames, width, height, ch=1):
+    """Parse the embedded JSON metadata.
+
+    The encoder's meta canvas block adapts down from M_META when the
+    canvas is small (FEC metadata on small geometry). Probe the same
+    candidate list the encoder walks, in the same order: the first block
+    that yields a valid JSON dict wins. If that dict declares a different
+    'mb', re-parse at the declared size (and prefer that result)."""
+    for block in (M_META, 14, 12, 10, 8, 6, M_META_MIN):
+        meta = _decode_meta_at(meta_frames, width, height, ch, block)
+        if not meta or 'fn' not in meta:
+            continue
+        declared = meta.get('mb', M_META)
+        if declared != block:
+            meta2 = _decode_meta_at(meta_frames, width, height, ch, int(declared))
+            if meta2 and 'fn' in meta2:
+                return meta2
+        return meta
+    return None
+
+
+def _decode_meta_at(meta_frames, width, height, ch, block):
+    """One parse attempt at meta-block size `block`. Returns the meta dict
+    or None on any failure."""
     try:
-        # Calculate cropped dimensions, multiples of M_META
-        cropped_width = (width // M_META) * M_META
-        cropped_height = (height // M_META) * M_META
-        blocks_x = cropped_width // M_META
-        blocks_y = cropped_height // M_META
+        # Calculate cropped dimensions, multiples of the meta block
+        cropped_width = (width // block) * block
+        cropped_height = (height // block) * block
+        blocks_x = cropped_width // block
+        blocks_y = cropped_height // block
         total_blocks = blocks_x * blocks_y
 
         # Frames carry `ch` channels (1 = gray stream, 3 = rgb24 stream).
@@ -759,9 +921,9 @@ def decode_meta_frames(meta_frames, width, height, ch=1):
             reshaped = stacked.reshape(
                 stacked.shape[0],
                 blocks_y,
-                M_META,
+                block,
                 blocks_x,
-                M_META,
+                block,
                 ch
             )
             # Averaging by block pixels and channels
@@ -770,9 +932,9 @@ def decode_meta_frames(meta_frames, width, height, ch=1):
             reshaped = stacked.reshape(
                 stacked.shape[0],
                 blocks_y,
-                M_META,
+                block,
                 blocks_x,
-                M_META
+                block
             )
             # Averaging by block pixels
             block_avgs = reshaped.mean(axis=(2, 4))
@@ -893,7 +1055,7 @@ def decode_fec_group_color(frames, M, R, width, height):
     payload at 3 bits/block. Returns (header8, payload_bytes) or None.
     """
     try:
-        bits_rgb, n_blocks = _color_from_frames(frames, M, R, width, height)
+        bits_rgb, n_blocks, margin = _color_from_frames(frames, M, R, width, height)
         flat = bits_rgb.reshape(-1).astype(np.uint8)  # (3*n_blocks,)
         n_payload_bytes = max(0, (3 * (n_blocks - HEADER_BITS)) // 8)
         # Header: 64 bits from blocks 0..63 — all three channels were drawn
@@ -909,7 +1071,7 @@ def decode_fec_group_color(frames, M, R, width, height):
         pb = flat[3 * HEADER_BITS:3 * HEADER_BITS + 8 * n_payload_bytes]
         payload = pb[:len(pb) // 8 * 8].reshape(-1, 8)
         payload = (payload * weights).sum(axis=1, dtype=np.uint8).tobytes()
-        return (bytes(header8), payload)
+        return (bytes(header8), payload, margin)
     except Exception as e:
         logging.error(f"Error decoding color FEC group: {str(e)}")
         return None
@@ -957,14 +1119,16 @@ def _fec_walk_groups(frame_queue, R, M, width, height, total_groups,
             return d
 
     def _check(res):
-        """(g, payload) if the decoded window verifies, else None."""
+        """(g, payload, margin) if the decoded window verifies, else None.
+        margin is None on the gray path (its decoder returns no margin)."""
         if res is None:
             return None
-        h8, payload = res
+        h8, payload = res[0], res[1]
         g, h_ok = unpack_header(h8)
         if h_ok and g is not None and 0 <= g < total_groups \
-                and zlib.crc32(payload) == header_crc(h8):
-            return (g, payload)
+                and crc_for_group(g, payload) == header_crc(h8):
+            margin = res[2] if len(res) > 2 else None
+            return (g, payload, margin)
         return None
 
     base = 0    # absolute stream-frame number of buf[0]
@@ -997,18 +1161,19 @@ def _fec_walk_groups(frame_queue, R, M, width, height, total_groups,
 
     def _resync(start):
         """Serial one-frame slide from `start` to the next intact boundary.
-        Returns (g, payload, new_cursor) or (None, None, None) at EOF."""
+        Returns (g, payload, margin, new_cursor) or (None, None, None, None)
+        at EOF."""
         off = 0
         while True:
             _fill(start + off + R)
             if base + len(buf) < start + off + R:
-                return None, None, None
+                return None, None, None, None
             res = (decode_fec_group_color if color else decode_fec_group)(
                 buf[start + off - base:start + off - base + R],
                 M, R, width, height)
             ok = _check(res)
             if ok is not None:
-                return ok[0], ok[1], start + off + R
+                return ok[0], ok[1], ok[2], start + off + R
             off += 1
 
     try:
@@ -1036,10 +1201,10 @@ def _fec_walk_groups(frame_queue, R, M, width, height, total_groups,
                 cursor = wstart + R
                 _compact(cursor)
             else:
-                g, payload, cursor = _resync(wstart)
+                g, payload, margin, cursor = _resync(wstart)
                 if g is None:
                     return
-                yield (g, payload)
+                yield (g, payload, margin)
                 _compact(cursor)
                 # The in-flight windows were aligned to the old boundary;
                 # after a cut they may straddle the new one, so resubmit.
@@ -1320,14 +1485,15 @@ def decode_video_to_file(video_path, num_processes):
                 return last_ss + idx_in
 
             groups_q = Queue()
+            min_margin = None  # tightest threshold margin over all decoded groups
 
             def _walker():
                 try:
-                    for g, payload in _fec_walk_groups(
+                    for g, payload, margin in _fec_walk_groups(
                             frame_queue, R, M, width, height, total_groups,
                             ffmpeg_process, reader_thread, stop_event,
                             frame_size, color=bool(meta.get('color'))):
-                        groups_q.put((g, payload))
+                        groups_q.put((g, payload, margin))
                 except Exception as e:
                     logging.error(f"FEC walker error: {str(e)}")
                 finally:
@@ -1344,11 +1510,13 @@ def decode_video_to_file(video_path, num_processes):
                     rec = groups_q.get(timeout=60)
                     if rec is None:
                         break
-                    g, payload = rec
+                    g, payload, margin = rec
                     if g in received_map:
                         logging.warning(f"FEC group {g} delivered twice; ignoring")
                         continue
                     received_map[g] = payload
+                    if margin is not None and (min_margin is None or margin < min_margin):
+                        min_margin = margin
                 out = bytearray()
                 repaired = 0
                 for s in range(n_strips):
@@ -1378,7 +1546,9 @@ def decode_video_to_file(video_path, num_processes):
                         logging.error(f"FEC hash mismatch: {actual} != {gh}")
                         raise FecError("payload hash mismatch")
                 logging.info(f"Successfully reconstructed {file_size} bytes "
-                             f"(FEC, {repaired} groups repaired from erasures)")
+                             f"(FEC, {repaired} groups repaired from erasures"
+                             + (f", min threshold margin {min_margin:.3%}"
+                                if min_margin is not None else "") + ")")
                 success = True
             except Empty:
                 logging.error(f"FEC decode stalled: no group for 60s "
@@ -1590,20 +1760,35 @@ if __name__ == "__main__":
 
     encode_parser = subparsers.add_parser("encode", help="Encode a file to video")
     encode_parser.add_argument("file_path", type=str, help="Path to the input file")
-    encode_parser.add_argument("M", type=int, help="Block size (M)")
-    encode_parser.add_argument("R", type=int, help="Repetition coefficient (R)")
+    encode_parser.add_argument("M", type=int, default=0,
+                               help="Block size (M). 0 = choose from --auto")
+    encode_parser.add_argument("R", type=int, default=0,
+                               help="Repetition coefficient (R). 0 = choose from --auto")
     encode_parser.add_argument("width", type=int, help="Image width")
     encode_parser.add_argument("height", type=int, help="Image height")
     encode_parser.add_argument("processes", type=int, help="Number of processes")
     encode_parser.add_argument("--crf", type=int, default=23, help="Video quality (CRF)")
     encode_parser.add_argument("--out", type=str, default=None,
                                help="Output video path (default: encoded/encoded_video.mp4)")
-    encode_parser.add_argument("--preset", type=str, default="medium",
-                               help="x264 preset: ultrafast..veryslow (default medium)")
+    encode_parser.add_argument("--preset", type=str, default=None,
+                               help="x264 preset: ultrafast..veryslow. "
+                                    "Default: from the --auto profile "
+                                    "(veryslow for color), or 'medium' "
+                                    "for explicit M/R encodes")
     encode_parser.add_argument("--fec-k", type=int, default=0,
                                help="FEC stripe: k data groups (0 = no FEC)")
     encode_parser.add_argument("--fec-m", type=int, default=0,
                                help="FEC stripe: m parity groups (0 = no FEC)")
+    encode_parser.add_argument("--auto", action="store_true",
+                               help="Pick M/R (and k/m when --fec-k is not given) "
+                                    "from the built-in density profile for "
+                                    "(width, height): M=0 R=0 ... --auto")
+    encode_parser.add_argument("--max-dense", action="store_true",
+                               help="With --auto: use the absolute-densest "
+                                    "profile (M=8 R=1 m=2, ~12 MB for 2 MB) "
+                                    "instead of the R=2 balance. Thinnest "
+                                    "protection — best when transport is mostly "
+                                    "whole-group drops/cuts.")
     encode_parser.add_argument("--color", action="store_true",
                                help="Color mode: 8-corner RGB palette, 3 bits "
                                     "per block (~3x faster/smaller than gray). "
@@ -1617,7 +1802,32 @@ if __name__ == "__main__":
 
     if args.mode == "encode":
         start_time = time.time()
-        if encode_file_to_video(args.file_path, args.M, args.R, args.width, args.height, args.processes, crf=args.crf, out_path=args.out, fec_k=args.fec_k, fec_m=args.fec_m, preset=args.preset, color=args.color):
+        M, R = args.M, args.R
+        fec_k, fec_m = args.fec_k, args.fec_m
+        if args.auto or M == 0 or R == 0:
+            prof = resolve_profile(args.width, args.height,
+                                   DENSITY_PROFILES_MAX if args.max_dense
+                                   else None)
+            if prof is None:
+                logging.error(f"No density profile for {args.width}x{args.height}; "
+                              f"pass M and R explicitly")
+                sys.exit(1)
+            pM, pR, pk, pm, ppreset = prof
+            M = pM if M == 0 else M
+            R = pR if R == 0 else R
+            if fec_k == 0:
+                fec_k, fec_m = pk, pm
+            if args.preset is None:
+                args.preset = ppreset
+            logging.info(f"Auto profile {args.width}x{args.height}"
+                         + (" (max-dense)" if args.max_dense else "") + f": "
+                         f"M={M} R={R} fec k={fec_k} m={fec_m} preset={args.preset}")
+        if args.preset is None:
+            # Explicit M/R without --auto: the measured balance for both
+            # modes (veryslow is a 3.7x cost for ~17% in gray, not worth
+            # making the default when the user is dialing in by hand).
+            args.preset = 'medium'
+        if encode_file_to_video(args.file_path, M, R, args.width, args.height, args.processes, crf=args.crf, out_path=args.out, fec_k=fec_k, fec_m=fec_m, preset=args.preset, color=args.color):
             elapsed = time.time() - start_time
             print(f"Encoding completed successfully in {elapsed:.2f} sec")
         else:

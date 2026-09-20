@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+venv/
+.venv/
+encoded/
+reconstructed/
+.cell.mp4
+.sweep.mp4

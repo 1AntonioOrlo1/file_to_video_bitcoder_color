@@ -1,49 +1,73 @@
-# file_to_video_bitcoder (color fork) 🎥 bit-level data embedding in video
+# bitcoder — hide any file inside an MP4 video (video steganography with error correction)
 
-A fast tool for embedding files into H.264 video frames. A fork of
-[1AntonioOrlo1/file_to_video_bitcoder](https://github.com/1AntonioOrlo1/file_to_video_bitcoder),
-an AI-assisted analog of [fvid](https://github.com/AlfredoSequeida/fvid),
-designed for high-speed steganography using bit-level manipulations in video
-pixels.
+**bitcoder** is a Python + FFmpeg tool for **video steganography**: it embeds an
+arbitrary file (a PNG, a zip, a video, a database — anything, up to gigabytes)
+into a standard, playable **H.264/MP4** video, and extracts it back
+**byte-exact** (SHA-256 verified). Unlike most steganography tools it survives
+lossy compression and can **repair lost or corrupted segments** with forward
+error correction (FEC) — no retransmission, no password exchange, no container
+metadata tricks.
 
-This fork adds **truecolor mode** (8-corner RGB palette) and **systematic MDS
-forward error correction** (including a full color-FEC path), on top of the
-upstream grayscale + FEC core.
+A fork of [1AntonioOrlo1/file_to_video_bitcoder](https://github.com/1AntonioOrlo1/file_to_video_bitcoder),
+itself an analog of [fvid](https://github.com/AlfredoSequeida/fvid). This fork
+adds **truecolor mode** (8-corner RGB palette, ~3× capacity), a full
+**color-FEC path**, DCT-aligned density profiles, and a measured
+maximum-density pipeline.
+
+## How it compares to other video steganography tools
+
+| Tool | Where the data lives | Capacity | Survives re-encode | Self-repair (FEC) |
+|---|---|---|---|---|
+| [OpenPuff](https://en.wikipedia.org/wiki/OpenPuff) | MP4 *container* (null-space of metadata) | MB-scale | no — any re-mux/re-encode destroys it | no |
+| [videostego](https://github.com/JavDomGom/videostego) | MP4 container bits | KB–MB | no | no |
+| [TwoPixels](https://github.com/anandbaburajan/TwoPixels), [Video-Steganography (LSB)](https://github.com/itxKAE/Video-Steganography) | pixel LSB of real footage | low (imperceptibility-first) | no — CRF 23 already flips LSBs | no |
+| [video-in-video](https://github.com/Amritaryal44/Video-Steganography), [StegoVideoDemo](https://github.com/mightymoogle/StegoVideoDemo) | raw pixel overwrite | high | no — lossy compression corrupts it | no (watermarking focus) |
+| **bitcoder (this)** | **pixel blocks of a noise video** | **~⅓ of the video's bytes are payload** (2 MB → ~6 MB) | **yes — CRF-23 H.264 roundtrip, byte-exact** | **yes — MDS GF(256), repairs ≤m groups per stripe** |
+
+Container-level tools (OpenPuff, videostego) hide bytes in the MP4 file
+structure — clever, but a single re-mux or platform re-encode destroys the
+payload, and published research (e.g. *"Steganalysis of OpenPuff through atomic
+concatenation of MP4 flags"*) already describes how to detect them.
+Imperceptibility-first pixel-LSB tools keep real footage looking natural, but
+their payload is a few kilobytes and any lossy re-encode flips it. bitcoder
+trades naturalness for **capacity + robustness**: the cover video is TV
+static, but it carries hundreds of times more data, round-trips through
+platform compression **bit-perfect**, and can even heal cut/lost segments.
+Use it when you need to *move* data, not when the footage must stay
+recognizable.
 
 ## ✨ Features
 
 - **Bit-level embedding** — file data is stored in $M \times M$ pixel blocks
-  across video frames; the video looks like ordinary static.
-- **Self-documenting** — JSON metadata (filename, size, all parameters) is
-  redundantly embedded in the first frames, so decoding needs no arguments.
+  across video frames; the video looks like ordinary static and plays anywhere.
+- **Byte-exact roundtrip** — decode reproduces the original file bit-for-bit
+  (SHA-256 verified end-to-end), measured on files from KB to GB.
 - **Color mode (`--color`)** — an 8-corner RGB palette (black, red, green,
-  blue, magenta, cyan, yellow, white) stores **3 bits per block**, one
-  independent threshold per channel. Grayscale stays a strict superset:
-  without `--color` the output and bitstream are byte-identical to upstream.
-  `M` must be even (yuv420p chroma alignment).
-- **FEC (`--fec-k`, `--fec-m`)** — systematic MDS erasure coding
+  blue, magenta, cyan, yellow, white) stores **3 bits per block** — ~3× the
+  capacity of grayscale at the same size. Grayscale stays a strict superset:
+  without `--color` the output is byte-identical to upstream.
+- **FEC (`--fec-k K --fec-m M`)** — systematic MDS erasure coding
   (Cauchy matrix over GF(256)) over whole frame groups: any `k` of the
-  `k + m` groups in a stripe suffice, so up to `m` groups may be lost.
-  Works in **both** grayscale and color modes — in color the 8-byte group
-  header is drawn chroma-neutral (black/white on all three channels) in the
-  first 64 blocks, the payload follows at 3 bits/block.
-- **Multithreaded** — frame workers on encode, a 16-thread parallel FEC group
-  walker with a sliding decode window and resync on decode.
-- **Resilient** — redundant frame copies ($R$) and block averaging survive
-  lossy H.264 compression (upstream measured perfect round-trips up to CRF 63
-  at $R = 30$).
-- **Stall-safe decoding** — a watchdog aborts with a clear error instead of
-  hanging when the frame stream ends unexpectedly; incomplete reconstructions
-  are removed on failure.
-- **No resampling** — the decoder reads frames at the video's native size,
-  exactly as encoded. If a host re-encoded the video at a different
-  resolution, the decoder reports a clear geometry error instead of guessing.
+  `k + m` groups in a stripe suffice, so **up to `m` groups may be lost,
+  cut, or corrupted and are still recovered**. Works in both gray and color
+  modes; group headers (magic + sequence + CRC-32) are drawn
+  chroma-neutral so compression can never fake or break them.
+- **`--auto` density profiles** — pass `0 0 --auto` and the tool picks the
+  measured-best recipe (M, R, k, m, x264 preset) for your geometry.
+  `--auto --max-dense` picks the absolute-densest one.
+- **Self-documenting** — JSON metadata (filename, size, all parameters,
+  payload hash) is redundantly embedded in the first frames; decoding needs
+  no arguments, and the embedded hash proves the reconstruction.
+- **Multithreaded** — frame workers on encode; a parallel FEC group walker
+  with sliding decode window, sequence resync, and a stall watchdog.
+- **Memory-bounded** — a 500 MB @ 1080p encode+decode held a flat ~2.2 GB RSS
+  (shared-memory frame pool, one file handle per worker); no leak.
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-1. **FFmpeg** in `PATH` (libx264 encoder + `ffprobe`).
+1. **FFmpeg** in `PATH` (libx264 + `ffprobe`).
 2. **Python 3.10+**
 
 ### Installation
@@ -59,40 +83,44 @@ python -m venv venv
 
 ```
 encode FILE M R WIDTH HEIGHT PROCESSES [--crf N] [--out PATH]
-       [--preset NAME] [--fec-k K] [--fec-m M] [--color]
+       [--preset NAME] [--fec-k K] [--fec-m M] [--color] [--auto]
+       [--max-dense]
 decode VIDEO PROCESSES
 ```
 
 | Argument | Meaning |
 |---|---|
-| `M` | block size, $M \times M$ pixels (must be even for `--color`) |
-| `R` | redundancy: each data frame is written $R$ times back-to-back |
+| `M` | block size, $M \times M$ pixels (must be even for `--color`; `0` = let `--auto` pick) |
+| `R` | redundancy: each data frame is written $R$ times back-to-back (`0` = let `--auto` pick) |
 | `WIDTH HEIGHT` | video geometry (even values) |
-| `PROCESSES` | worker count (16 is a good default) |
+| `PROCESSES` | worker count |
 | `--crf N` | x264 quality (default 23) |
-| `--preset NAME` | x264 preset `ultrafast`…`veryslow` (default `medium`) |
+| `--preset NAME` | x264 preset `ultrafast`…`veryslow`. Default: from the `--auto` profile (`veryslow` for color), or `medium` for explicit M/R encodes |
 | `--out PATH` | output video (default `encoded/encoded_video.mp4`) |
-| `--fec-k K --fec-m M` | FEC stripe: `K` data + `M` parity groups (omit = no FEC) |
+| `--fec-k K --fec-m M` | FEC stripe: `K` data + `M` parity groups (omit = no FEC; GF(256) cap `2k+m-2 ≤ 255`) |
 | `--color` | color mode (default: grayscale) |
+| `--auto` | pick `M`, `R`, `k`/`m` and the x264 preset from the built-in density profile for the geometry — pass `0 0` and `--auto` (default = M=8 R=2, k=127, veryslow — ~6 MB for 2 MB) |
+| `--max-dense` | with `--auto`: the absolute-densest profile (M=8 R=1, k=127, veryslow, ~5.6 MB for 2 MB) — thinnest protection, best for whole-group drops/cuts |
 
 ### Examples
 
-Grayscale:
+The recommended one-liners (`--auto` picks everything):
 
 ```bash
+# densest balanced (M=8 R=2, k=127, veryslow, ~6 MB for 2 MB):
+./venv/bin/python VC7030_color.py encode input.bin 0 0 1920 1080 8 --color --auto
+# absolute-densest (M=8 R=1, k=127, veryslow, ~5.6 MB for 2 MB):
+./venv/bin/python VC7030_color.py encode input.bin 0 0 1920 1080 8 --color --auto --max-dense
+```
+
+Explicit recipes:
+
+```bash
+# Grayscale:
 ./venv/bin/python VC7030_color.py encode tiny_input.bin 16 30 640 480 4 --crf 23
-```
-
-Color (3 bits/block — about 3x more capacity, smaller/faster video):
-
-```bash
+# Color (3 bits/block):
 ./venv/bin/python VC7030_color.py encode tiny_input.bin 16 30 640 480 4 --crf 23 --color
-```
-
-Error-correcting color, 720p, 16 workers, tolerates 4 lost groups per stripe
-of 8:
-
-```bash
+# Error-correcting color, 720p, 16 workers, tolerates 4 lost groups per stripe:
 ./venv/bin/python VC7030_color.py encode big_input.bin 8 4 1280 720 16 \
     --crf 23 --color --fec-k 8 --fec-m 4
 ```
@@ -124,29 +152,85 @@ written $R$ times back-to-back.
   whole payload against the embedded hash.
 
 **Geometry floor for FEC.** FEC metadata is larger than plain metadata (it
-carries the stream hash). Very small canvases cannot hold it — e.g. 640x360
-with `M = 16` gives only 880 blocks vs ~1184 bits needed; the encoder raises
-a clear hint. 720p and up is comfortable.
+carries the stream hash). The metadata canvas now adapts: `meta_block_size()`
+shrinks the meta block from 16 down to 4 (recorded in the JSON as `mb`)
+until it fits, so the old 720p+ minimum is gone — 640×360 with FEC works.
+The decoder probes the same candidate sizes and re-reads at the declared `mb`.
+
+## 🎚️ Density profiles (color + FEC, typical YouTube sizes)
+
+`run_profiles.py` sweeps (geometry × M × R × m) on a real 2 MB PNG at CRF 23,
+recording mp4 size, byte-exactness, and the **minimum threshold margin** the
+decoder reports. `run_ksweep.py` sweeps the **stripe length k** (the last
+density lever): parity overhead is `m·ceil(n_data/k)/n_data`, so k=8 = 25.6%
+of groups, k=64 = 3.7%, **k=127 = 2.4%** — the GF(256) Cauchy cap for m=2
+(`2k+m-2 ≤ 255`). The winner is **M=8 at every geometry**, k=127, veryslow:
+
+| Geometry | M | R | k/m | preset | size (2 MB file) |
+|---|---|---|---|---|---|
+| 1280×720 | 8 | 2 | 127/2 | veryslow | ~5–6 MB |
+| 1920×1080 | 8 | 2 | 127/2 | veryslow | ~6 MB |
+| 3840×2160 | 8 | 2 | 127/2 | veryslow | ~6 MB |
+
+One long stripe (k=127) covers almost the whole file, so losses in
+*different places* are repaired, not just adjacent pairs — and m=2 costs
+only ~1.3% over m=1 at this k, so the double protection is nearly free.
+Slow preset: the flat DCT-aligned 0/255 blocks compress ~2× denser than
+medium (color R=1: 12 MB medium → 6 MB veryslow).
+
+**Maximum-density option (`--auto --max-dense`):** M=8 **R=1** k=127 m=2,
+veryslow → ~5.6 MB (1080p), byte-exact, and it repairs real group cuts
+(1 and 2 lost groups → repaired, 10/10 as expected incl. the short last
+stripe). The trick: because M=8 is DCT-aligned, the threshold margin stays
+~73–78% **even with a single copy** — compression flips no bits, so any
+damage (a whole-group loss *or* a bit-flipped frame) shows up as a failed
+group CRC and is repaired as an erasure, as long as ≤ m per stripe. That is
+the densest point where the FEC actually earns its keep.
+
+**Why the size is resolution-independent:** the stream volume is
+`~filesize · R · M²`, not tied to W×H. A bigger canvas just fits more blocks
+per frame; the number of *groups* needed to carry the file is set by the
+bytes-per-group, which scales with `M²`.
+
+**Why M=8 and not smaller:** its block edges land on x264's 8×8 DCT grid, so
+a solid white 0/255 block encodes in ~1 bit. A misaligned M (6 / 10 / 12)
+smears the hard edge across DCT blocks and costs **4–6× in bitrate** —
+1080p, R=4, m=2: M=4→23 MB, M=6→71, **M=8→17.9**, M=10→108, M=12→73.5,
+M=16→65.6, M=24→90.9 MB. M=8 is the smallest aligned size and keeps the
+margin high, so compression flips no bits and the `m` parity groups are
+pure whole-group-erasure insurance. `--auto` applies the table; the trade
+knobs are `m` (size for erasure tolerance) and `R` (size for margin).
+
+**Why 8 colors and not more:** multi-level palettes (16/64-color) put their
+decision thresholds at the midpoint between levels, and 4:2:0 chroma
+subsampling averages block-boundary pixels *exactly onto* those thresholds —
+16-color fails byte-exact even at CRF 0 (`proto_16color.py` documents the
+experiment). The binary 8-corner palette's single per-channel threshold (128)
+is maximally distant from both levels; it is the only palette that survives.
 
 ## 📊 Benchmarks
 
-Verified end-to-end (encode → decode → SHA-256 byte-exact), 16 workers,
+Verified end-to-end (encode → decode → SHA-256 byte-exact), 8 workers,
 x264, CRF 23:
 
-| Source | Geometry | Mode | Encode | Decode |
-|---|---|---|---|---|
-| 16 MiB | 640x360 – 3840x2160 | gray, color | seconds | seconds |
-| 16 MiB | 1280x720 – 1920x1080 | color + FEC (k4/m2, k8/m4) | 14–67 s | 13–43 s |
-| 1 GiB | 3840x2160 | gray | 976 s | 373 s |
-| 1 GiB | 3840x2160 | color | 509 s | 529 s |
-| 1 GiB | 3840x2160 | color + FEC (k8/m4, 8289 groups) | 923 s | 477 s |
+| Source | Geometry | Mode | Result |
+|---|---|---|---|
+| 2 MB | 720p / 1080p / 4K | color + FEC, `--auto` (M=8 R=2 k=127 m=2, veryslow) | **~6 MB**, byte-exact |
+| 2 MB | 1080p | color + FEC, `--auto --max-dense` (R=1) | **~5.6 MB**, byte-exact |
+| 2 MB | 1080p | color + FEC, `--auto --max-dense`, loss test | 1–2 group cuts repaired, 3 fails (10/10 as expected) |
+| 500 MB | 1080p | color + FEC (R=1, medium) | enc 993 s / dec 278 s, byte-exact, **flat ~2.2 GB RSS** (no leak) |
+| 1 GiB | 3840×2160 | gray | enc 976 s / dec 373 s |
+| 1 GiB | 3840×2160 | color | enc 509 s / dec 529 s |
+| 1 GiB | 3840×2160 | color + FEC (k8/m4, 8289 groups) | enc 923 s / dec 477 s (~13.5 GB mp4) |
 
-FEC erasure testing (720p, color, k4/m2): cutting 1 whole group → repaired;
-cutting 2 (the maximum) → repaired; cutting 3 from one stripe → correctly
-fails.
+FEC erasure testing (1080p, color, k=127/m=2): cutting 1 whole group →
+repaired; 2 (the maximum) → repaired; 3 from one stripe → correctly fails.
+Same verdict at k=8/m=2. The short last stripe (k_s < k) also repairs.
 
-**Memory note:** a 1 GiB 4K encode peaks at ~5–9 GB of RAM (rgb24 reader +
-frame pool). On a machine without headroom, expect the OS to kill or stall it.
+**Memory note:** the frame pool lives in `/dev/shm` and is shared by all
+workers (only slot indices cross the IPC boundary); a 500 MB 1080p run held
+~2.2 GB RSS end-to-end. A 1 GiB **4K** run is the heavy case (rgb24 reader +
+pool): expect several GB; on a tight machine, lower the geometry or add swap.
 
 ## 🧪 Verification
 
@@ -156,7 +240,10 @@ edge cases (empty file, exact-frame boundaries, odd $M$ rejected, odd
 dimensions rejected, $M \in \{4,6,8,12,16\}$, process-count determinism);
 FEC cross-compatibility with the upstream program; rescaled-video clean
 failure; and the 1 GiB 4K gray/color/FEC finals. All cells round-trip
-byte-exact (the only excluded cell: 360p + FEC, below the geometry floor).
+byte-exact. Helper harnesses in this repo: `run_profiles.py` (density),
+`run_ksweep.py` (stripe length), `run_sweep.py` (R/m), `run_loss.py`
+(FEC erasure injection), `run_memtest.py` (big-file RSS sampling),
+`proto_16color.py` (palette experiment).
 
 ## 📄 License
 
