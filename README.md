@@ -14,56 +14,28 @@ adds **truecolor mode** (8-corner RGB palette, ~3× capacity), a full
 **color-FEC path**, DCT-aligned density profiles, and a measured
 maximum-density pipeline.
 
-## How it compares to other video steganography tools
+## 🎬 Live example — watch it work
 
-| Tool | Where the data lives | Capacity | Survives re-encode | Self-repair (FEC) |
-|---|---|---|---|---|
-| [fvid](https://github.com/AlfredoSequeida/fvid) | 1-bit pixel frames (this project's ancestor) | 1 bit/px | partially — threshold decoding survives mild re-compression, but any lost frame is unrecoverable | no |
-| [bin2video](https://github.com/pixelomer/bin2video) | raw binary → video frames (C, 1–24 bits/pixel) | high | no — no ECC, frame loss = data loss | no |
-| [file-to-video](https://github.com/oyetanishq/file-to-video) | binary video frames (C++) | high | no | no |
-| [UltraStore](https://github.com/Akul-af/UltraStore) | lossless **FFV1/MKV** stream | high (archival) | yes by construction (FFV1 lossless) — but a cut/dropped frame is still unrecoverable | no |
-| [yts3](https://github.com/freddiev4/yts3) | lossless FFV1/MKV via DCT steganography (Rust) | high, tuned for **YouTube as storage** | yes — lossless container; no per-frame redundancy | no |
-| [Infinite Storage Glitch](https://github.com/4A49/Infinite-Storage-Glitch) / [InfinityVault](https://github.com/thebitanpaul/InfinityVault) | file → binary → MP4 → file | high | no | no |
-| [yt-media-storage](https://github.com/PulseBeat02/yt-media-storage) | uploadable media (GUI + batch) | high | no | no |
-| [mp4modem](https://github.com/grmchn/mp4modem) | visible H.264/MP4 stream | medium | yes — designed to survive compatible transcoding | no |
-| [qrstream-enhanced](https://github.com/ddddavid-he/qrstream-enhanced) | QR-code video | medium | yes — **RaptorQ/LT fountain codes** recover from lost frames | **yes (fountain codes)** |
-| [Bit2Vid](https://github.com/nuan-cmyk/Bit2Vid) | binary → MP4, AES-256-GCM + Reed–Solomon | medium | yes — RS ECC repairs damaged blocks | **yes (Reed–Solomon)** |
-| [TexelDB](https://github.com/iamrknain/TexelDB) | images/frames → GIF (visual data storage) | medium | no | no |
-| Pixel Video Encoder/Decoder | AVI/PNG frames | medium | no | no |
-| [OpenPuff](https://en.wikipedia.org/wiki/OpenPuff) | MP4 *container* (null-space of metadata) | MB-scale | no — any re-mux/re-encode destroys it | no |
-| [videostego](https://github.com/JavDomGom/videostego) | MP4 container bits | KB–MB | no | no |
-| [TwoPixels](https://github.com/anandbaburajan/TwoPixels), [Video-Steganography (LSB)](https://github.com/itxKAE/Video-Steganography) | pixel LSB of real footage | low (imperceptibility-first) | no — CRF 23 already flips LSBs | no |
-| [video-in-video](https://github.com/Amritaryal44/Video-Steganography), [StegoVideoDemo](https://github.com/mightymoogle/StegoVideoDemo) | raw pixel overwrite | high | no — lossy compression corrupts it | no (watermarking focus) |
-| **file to video bitcoder (this)** | **pixel blocks of a noise video** | **~⅓ of the video's bytes are payload** (2 MB → ~6 MB) | **yes — CRF-23 H.264 roundtrip, byte-exact, verified on 6.94 GB** | **yes — MDS GF(256), repairs ≤m groups per stripe** |
+[`examples/hidden_in_video.mp4`](examples/hidden_in_video.mp4) (6.3 MB,
+1920×1080, ~12 s of colorful static) contains the 1.98 MB PNG
+`GtelhrJb0AAkpnI2.png`. Play it, save it, then run:
 
-Container-level tools (OpenPuff, videostego) hide bytes in the MP4 file
-structure — clever, but a single re-mux or platform re-encode destroys the
-payload, and published research (e.g. *"Steganalysis of OpenPuff through atomic
-concatenation of MP4 flags"*) already describes how to detect them.
-Imperceptibility-first pixel-LSB tools keep real footage looking natural, but
-their payload is a few kilobytes and any lossy re-encode flips it.
-The plain **file-to-video** family (bin2video, file-to-video,
-Infinite-Storage-Glitch, …) solves the transport problem but has no
-redundancy at all: one dropped or reordered frame corrupts everything after
-it, and the lossless-FFV1 variants (UltraStore, yts3) trade a very large
-container for zero resilience to cuts. The ECC-equipped tools (Bit2Vid's
-Reed–Solomon, qrstream-enhanced's fountain codes) are the closest in spirit —
-file-to-video bitcoder goes further: the payload survives a **lossy H.264
-re-encode** (the standard YouTube/cloud path) **and** repairs up to `m`
-whole-group erasures per stripe with MDS coding over GF(256), verified
-byte-exact on a 6.94 GB file.
-bitcoder trades naturalness for **capacity + robustness**: the cover video is
-TV static, but it carries hundreds of times more data than LSB tools,
-round-trips through platform compression **bit-perfect**, and can even heal
-cut/lost segments. Use it when you need to *move* data, not when the footage
-must stay recognizable.
+```bash
+./venv/bin/python VC7030_color.py decode examples/hidden_in_video.mp4 8
+```
+
+You get `reconstructed/GtelhrJb0AAkpnI2.png` with SHA-256
+`7a654c51e1a589e7b12907b7373e975db9550830788f2a98f0bd7af24366cd5b` —
+**bit-identical to the original**, 0 groups repaired, 77.2% minimum
+threshold margin (measured). The video plays in any player; the data is
+the motion you see.
 
 ## ✨ Features
 
 - **Bit-level embedding** — file data is stored in $M \times M$ pixel blocks
   across video frames; the video looks like ordinary static and plays anywhere.
 - **Byte-exact roundtrip** — decode reproduces the original file bit-for-bit
-  (SHA-256 verified end-to-end), measured on files from KB to GB.
+  (SHA-256 verified end-to-end), measured on files from KB to 6.94 GB.
 - **Color mode (`--color`)** — an 8-corner RGB palette (black, red, green,
   blue, magenta, cyan, yellow, white) stores **3 bits per block** — ~3× the
   capacity of grayscale at the same size. Grayscale stays a strict superset:
@@ -84,6 +56,9 @@ must stay recognizable.
   with sliding decode window, sequence resync, and a stall watchdog.
 - **Memory-bounded** — a 500 MB @ 1080p encode+decode held a flat ~2.2 GB RSS
   (shared-memory frame pool, one file handle per worker); no leak.
+- **Any file size** — the 16-bit group-sequence wrap is tracked in the
+  decoder (`SeqWrapTracker`), so streams of hundreds of thousands of groups
+  (multi-GB files) decode correctly.
 
 ## 🚀 Quick Start
 
@@ -149,7 +124,7 @@ Notes:
   6.94 GB file encoded in ~3 h and decoded byte-exact (verified).
   `--max-dense` halves the encode time vs `--auto` (R=1 vs R=2).
 
-### CLI
+### CLI reference
 
 ```
 encode FILE M R WIDTH HEIGHT PROCESSES [--crf N] [--out PATH]
@@ -172,18 +147,7 @@ decode VIDEO PROCESSES
 | `--auto` | pick `M`, `R`, `k`/`m` and the x264 preset from the built-in density profile for the geometry — pass `0 0` and `--auto` (default = M=8 R=2, k=127, veryslow — ~6 MB for 2 MB) |
 | `--max-dense` | with `--auto`: the absolute-densest profile (M=8 R=1, k=127, veryslow, ~5.6 MB for 2 MB) — thinnest protection, best for whole-group drops/cuts |
 
-### Examples
-
-The recommended one-liners (`--auto` picks everything):
-
-```bash
-# densest balanced (M=8 R=2, k=127, veryslow, ~6 MB for 2 MB):
-./venv/bin/python VC7030_color.py encode input.bin 0 0 1920 1080 8 --color --auto
-# absolute-densest (M=8 R=1, k=127, veryslow, ~5.6 MB for 2 MB):
-./venv/bin/python VC7030_color.py encode input.bin 0 0 1920 1080 8 --color --auto --max-dense
-```
-
-Explicit recipes:
+Explicit recipes (when you want to tune by hand):
 
 ```bash
 # Grayscale:
@@ -193,12 +157,6 @@ Explicit recipes:
 # Error-correcting color, 720p, 16 workers, tolerates 4 lost groups per stripe:
 ./venv/bin/python VC7030_color.py encode big_input.bin 8 4 1280 720 16 \
     --crf 23 --color --fec-k 8 --fec-m 4
-```
-
-Decode (parameters come from the embedded metadata — no flags needed):
-
-```bash
-./venv/bin/python VC7030_color.py decode encoded/encoded_video.mp4 16
 ```
 
 The reconstructed file is written to `reconstructed/<original_filename>`
@@ -219,7 +177,10 @@ written $R$ times back-to-back.
   Parity groups are GF(256) Cauchy combinations of the stripe's data groups.
   The decoder walks the stream in parallel, matches groups by sequence
   number, repairs each stripe from any `k` survivors, and verifies the
-  whole payload against the embedded hash.
+  whole payload against the embedded hash. The 16-bit sequence field wraps
+  every 65536 groups; `SeqWrapTracker` reconstructs the true index from the
+  stream-order fall, so multi-GB files (hundreds of thousands of groups)
+  decode correctly.
 
 **Geometry floor for FEC.** FEC metadata is larger than plain metadata (it
 carries the stream hash). The metadata canvas now adapts: `meta_block_size()`
@@ -288,7 +249,9 @@ x264, CRF 23:
 | 2 MB | 720p / 1080p / 4K | color + FEC, `--auto` (M=8 R=2 k=127 m=2, veryslow) | **~6 MB**, byte-exact |
 | 2 MB | 1080p | color + FEC, `--auto --max-dense` (R=1) | **~5.6 MB**, byte-exact |
 | 2 MB | 1080p | color + FEC, `--auto --max-dense`, loss test | 1–2 group cuts repaired, 3 fails (10/10 as expected) |
+| 45 MB | 640×360 | color + FEC (M=16 R=2, 155 417 groups, both seq wraps) | byte-exact (wrap-boundary regression) |
 | 500 MB | 1080p | color + FEC (R=1, medium) | enc 993 s / dec 278 s, byte-exact, **flat ~2.2 GB RSS** (no leak) |
+| **6.94 GB** | 1080p | color + FEC, `--auto --max-dense` (medium) | **enc 10 405 s → 34.3 MB mp4, dec 2 940 s, 0 repairs, 68.5% margin, SHA-256 exact** |
 | 1 GiB | 3840×2160 | gray | enc 976 s / dec 373 s |
 | 1 GiB | 3840×2160 | color | enc 509 s / dec 529 s |
 | 1 GiB | 3840×2160 | color + FEC (k8/m4, 8289 groups) | enc 923 s / dec 477 s (~13.5 GB mp4) |
@@ -313,7 +276,52 @@ failure; and the 1 GiB 4K gray/color/FEC finals. All cells round-trip
 byte-exact. Helper harnesses in this repo: `run_profiles.py` (density),
 `run_ksweep.py` (stripe length), `run_sweep.py` (R/m), `run_loss.py`
 (FEC erasure injection), `run_memtest.py` (big-file RSS sampling),
-`proto_16color.py` (palette experiment).
+`run_wraptest.py` (16-bit seq wrap boundaries), `proto_16color.py`
+(palette experiment).
+
+## 🆚 How it compares to other tools
+
+| Tool | Where the data lives | Capacity | Survives re-encode | Self-repair (FEC) |
+|---|---|---|---|---|
+| [fvid](https://github.com/AlfredoSequeida/fvid) | 1-bit pixel frames (this project's ancestor) | 1 bit/px | partially — threshold decoding survives mild re-compression, but any lost frame is unrecoverable | no |
+| [bin2video](https://github.com/pixelomer/bin2video) | raw binary → video frames (C, 1–24 bits/pixel) | high | no — no ECC, frame loss = data loss | no |
+| [file-to-video](https://github.com/oyetanishq/file-to-video) | binary video frames (C++) | high | no | no |
+| [UltraStore](https://github.com/Akul-af/UltraStore) | lossless **FFV1/MKV** stream | high (archival) | yes by construction (FFV1 lossless) — but a cut/dropped frame is still unrecoverable | no |
+| [yts3](https://github.com/freddiev4/yts3) | lossless FFV1/MKV via DCT steganography (Rust) | high, tuned for **YouTube as storage** | yes — lossless container; no per-frame redundancy | no |
+| [Infinite Storage Glitch](https://github.com/4A49/Infinite-Storage-Glitch) / [InfinityVault](https://github.com/thebitanpaul/InfinityVault) | file → binary → MP4 → file | high | no | no |
+| [yt-media-storage](https://github.com/PulseBeat02/yt-media-storage) | uploadable media (GUI + batch) | high | no | no |
+| [mp4modem](https://github.com/grmchn/mp4modem) | visible H.264/MP4 stream | medium | yes — designed to survive compatible transcoding | no |
+| [qrstream-enhanced](https://github.com/ddddavid-he/qrstream-enhanced) | QR-code video | medium | yes — **RaptorQ/LT fountain codes** recover from lost frames | **yes (fountain codes)** |
+| [Bit2Vid](https://github.com/nuan-cmyk/Bit2Vid) | binary → MP4, AES-256-GCM + Reed–Solomon | medium | yes — RS ECC repairs damaged blocks | **yes (Reed–Solomon)** |
+| [TexelDB](https://github.com/iamrknain/TexelDB) | images/frames → GIF (visual data storage) | medium | no | no |
+| Pixel Video Encoder/Decoder | AVI/PNG frames | medium | no | no |
+| [OpenPuff](https://en.wikipedia.org/wiki/OpenPuff) | MP4 *container* (null-space of metadata) | MB-scale | no — any re-mux/re-encode destroys it | no |
+| [videostego](https://github.com/JavDomGom/videostego) | MP4 container bits | KB–MB | no | no |
+| [TwoPixels](https://github.com/anandbaburajan/TwoPixels), [Video-Steganography (LSB)](https://github.com/itxKAE/Video-Steganography) | pixel LSB of real footage | low (imperceptibility-first) | no — CRF 23 already flips LSBs | no |
+| [video-in-video](https://github.com/Amritaryal44/Video-Steganography), [StegoVideoDemo](https://github.com/mightymoogle/StegoVideoDemo) | raw pixel overwrite | high | no — lossy compression corrupts it | no (watermarking focus) |
+| **file to video bitcoder (this)** | **pixel blocks of a noise video** | **~⅓ of the video's bytes are payload** (2 MB → ~6 MB) | **yes — CRF-23 H.264 roundtrip, byte-exact, verified on 6.94 GB** | **yes — MDS GF(256), repairs ≤m groups per stripe** |
+
+Container-level tools (OpenPuff, videostego) hide bytes in the MP4 file
+structure — clever, but a single re-mux or platform re-encode destroys the
+payload, and published research (e.g. *"Steganalysis of OpenPuff through atomic
+concatenation of MP4 flags"*) already describes how to detect them.
+Imperceptibility-first pixel-LSB tools keep real footage looking natural, but
+their payload is a few kilobytes and any lossy re-encode flips it.
+The plain **file-to-video** family (bin2video, file-to-video,
+Infinite-Storage-Glitch, …) solves the transport problem but has no
+redundancy at all: one dropped or reordered frame corrupts everything after
+it, and the lossless-FFV1 variants (UltraStore, yts3) trade a very large
+container for zero resilience to cuts. The ECC-equipped tools (Bit2Vid's
+Reed–Solomon, qrstream-enhanced's fountain codes) are the closest in spirit —
+file-to-video bitcoder goes further: the payload survives a **lossy H.264
+re-encode** (the standard YouTube/cloud path) **and** repairs up to `m`
+whole-group erasures per stripe with MDS coding over GF(256), verified
+byte-exact on a 6.94 GB file.
+bitcoder trades naturalness for **capacity + robustness**: the cover video is
+TV static, but it carries hundreds of times more data than LSB tools,
+round-trips through platform compression **bit-perfect**, and can even heal
+cut/lost segments. Use it when you need to *move* data, not when the footage
+must stay recognizable.
 
 ## 📄 License
 
