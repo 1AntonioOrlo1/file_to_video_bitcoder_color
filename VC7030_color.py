@@ -626,7 +626,7 @@ def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_by
 
 def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
                          out_path=None, fec_k=0, fec_m=0, preset='medium',
-                         color=False, tail_m=None):
+                         color=False, tail_m=None, fps=30):
     try:
         start_time = time.time()
         output_dir = get_output_directory()
@@ -778,7 +778,7 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
             '-vcodec', 'rawvideo',
             '-s', f'{width}x{height}',  # Frame size
             '-pix_fmt', in_pix_fmt,  # Input format: rgb24 (color) / gray (b/w)
-            '-r', '30',             # Frame rate
+            '-r', str(fps),          # Frame rate
             '-i', '-',              # Read from stdin
             '-c:v', 'libx264',      # Codec
             '-pix_fmt', 'yuv420p',  # Pixel format
@@ -1926,6 +1926,12 @@ if __name__ == "__main__":
                                     "The short last stripe is the one a "
                                     "re-encoding platform trims, so it gets "
                                     "extra redundancy at a cost of a few frames")
+    encode_parser.add_argument("--fps", type=int, default=30,
+                               help="Container frame rate (default 30). "
+                                    "60 halves the wall-clock duration of "
+                                    "the same data; the payload is "
+                                    "resolution-independent, so size and "
+                                    "re-encode thresholds are unchanged")
     encode_parser.add_argument("--auto", action="store_true",
                                help="Pick M/R (and k/m when --fec-k is not given) "
                                     "from the built-in density profile for "
@@ -1974,7 +1980,7 @@ if __name__ == "__main__":
             # modes (veryslow is a 3.7x cost for ~17% in gray, not worth
             # making the default when the user is dialing in by hand).
             args.preset = 'medium'
-        if encode_file_to_video(args.file_path, M, R, args.width, args.height, args.processes, crf=args.crf, out_path=args.out, fec_k=fec_k, fec_m=fec_m, preset=args.preset, color=args.color, tail_m=args.tail_m):
+        if encode_file_to_video(args.file_path, M, R, args.width, args.height, args.processes, crf=args.crf, out_path=args.out, fec_k=fec_k, fec_m=fec_m, preset=args.preset, color=args.color, tail_m=args.tail_m, fps=args.fps):
             elapsed = time.time() - start_time
             print(f"Encoding completed successfully in {elapsed:.2f} sec")
         else:
