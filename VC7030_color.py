@@ -438,16 +438,27 @@ def _close_pool(shm):
 
 def _read_group_payload(fh, frame_idx, pd, group_bytes, total_bits):
     """Byte-aligned payload of data group `frame_idx`: exactly group_bytes
-    bytes (the last group is zero-padded to a full byte count so that every
+    bytes (the last group is padded to a full byte count so that every
     row of a stripe has the same length — GF(256) operates on equal-length
     byte vectors). `fh` is a seekable binary file handle opened once per
-    worker (the old per-call open() cost a syscall pair per group)."""
+    worker (the old per-call open() cost a syscall pair per group).
+
+    Padding is a REPEAT of the group's real bytes, not zeros: a zero-padded
+    final group renders ~95% black, and the all-black flash at the end of
+    the video was exactly that (visible even before any re-encode). The
+    repeat is deterministic — encoder data group, parity recomputation, and
+    any MDS repair all read the same padded rows — and the decoder trims
+    the padding to file_size, so the payload bytes are unaffected."""
     start_bit = frame_idx * pd  # pd is a multiple of 8, so this is byte-aligned
     end_bit = min(start_bit + pd, total_bits)
     n_bytes = max(0, (end_bit + 7) // 8 - start_bit // 8)
     fh.seek(start_bit // 8)
     chunk = fh.read(n_bytes)
-    return chunk.ljust(group_bytes, b'\x00')
+    if len(chunk) < group_bytes:
+        if not chunk:
+            return b'\x00' * group_bytes
+        chunk = (chunk * -(-group_bytes // len(chunk)))[:group_bytes]
+    return chunk
 
 
 def _fec_group_frame(fh, frame_idx, M, width, height, pd,
