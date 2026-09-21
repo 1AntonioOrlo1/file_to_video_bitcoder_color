@@ -1988,6 +1988,23 @@ if __name__ == "__main__":
             # modes (veryslow is a 3.7x cost for ~17% in gray, not worth
             # making the default when the user is dialing in by hand).
             args.preset = 'medium'
+        # Known-trap warnings (measured on real YouTube, 2026-09-21):
+        #  - max-dense (R=1) + 60 fps: YouTube re-encodes 60 fps as AV1 and
+        #    the single-copy body lost 58/129 groups there (1080p test).
+        #  - max-dense without --tail-m: platforms trim the END of the
+        #    stream, exactly where all parity lives in the R=1 layout.
+        if args.max_dense:
+            if args.fps > 30:
+                logging.warning(
+                    "max-dense (R=1) at %d fps is a measured-fail combo: "
+                    "YouTube re-encodes 60 fps as AV1 and destroyed the "
+                    "single-copy body (58/129 groups). Use the balanced "
+                    "--auto (R=2) with --tail-m 15 instead.", args.fps)
+            if args.tail_m is None:
+                logging.warning(
+                    "max-dense without --tail-m: platforms trim the end of "
+                    "the stream, where all parity lives. Add --tail-m 5 "
+                    "(30 fps) or --tail-m 15 (60 fps) for platform uploads.")
         if encode_file_to_video(args.file_path, M, R, args.width, args.height, args.processes, crf=args.crf, out_path=args.out, fec_k=fec_k, fec_m=fec_m, preset=args.preset, color=args.color, tail_m=args.tail_m, fps=args.fps):
             elapsed = time.time() - start_time
             print(f"Encoding completed successfully in {elapsed:.2f} sec")
