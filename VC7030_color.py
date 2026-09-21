@@ -52,13 +52,23 @@ R_META = 30  # Number of metadata copies
 # ~12.5% size for more erasure tolerance; raising R trades size for margin.
 #
 # The 5th element is the x264 preset the auto mode uses when the user did
-# not pass --preset. The measured winners (2 MB PNG, CRF 23, 1080p):
-#   color  R=1: medium 12 MB / slow 10 MB / veryslow 6 MB (2.7x slower)
-#   gray   R=2: medium  6 MB / veryslow 5 MB (3.7x slower)
-# Color frames are a regular flat 0/255 DCT-aligned pattern, so a slow
-# preset with a big lookahead compresses them ~2x denser — that is why
-# color auto picks veryslow. Gray patterns are less regular (1 bit/block),
-# so veryslow saves only ~17% and medium stays the balance.
+# not pass --preset. Full 9-preset ladder measured 2026-09-21 (2 MB PNG,
+# CRF 23, 1080p color R=2 k=127), with survival = margin after a harsh
+# libaom-av1 13 Mbps re-encode (the budget that matched real YouTube):
+#   veryslow 6 fps 6.0 MB 78.0 % | slower 28 fps 7.0 MB 80.1 %
+#   slow 52 fps 9.3 MB 78.7 %    | medium 46 fps 10.6 MB 78.9 %
+#   fast 104 fps 11.5 MB 74.8 %  | faster 122 fps 12.2 MB 68.9 %
+#   veryfast 122 fps 17.0 MB 62.3 % | superfast 122 fps 19.1 MB 59.4 %
+#   ultrafast 122 fps 48.4 MB 72.0 %
+# Survival is NOT the constraint — every preset survives (59–80%), the flat
+# DCT-aligned 0/255 blocks flip no bits. The knee is 'slower': 4.7x faster
+# than veryslow for +16% size and the HIGHEST survival margin of the ladder;
+# 'slow' costs another +33% size for x1.9 speed, medium buys zero speed.
+# 4K confirms the knee: +10% size (7.1->7.8 MB), x1.9 speed, and the
+# VP9 13 Mbps re-encode stays byte-exact (margin 18.9% vs 23.2% — the
+# single-stripe tail is where bits matter, 18.9% still comfortable).
+# Gray patterns are less regular (1 bit/block), presets save little there
+# (gray R=2: veryslow 5 MB vs medium 6 MB) — gray auto keeps 'medium'.
 #
 # The stripe is k=127 (the GF(256) Cauchy cap for m=2: 2k+m-2 <= 255).
 # 4K is the exception: k=21. At 4K one group carries 4x the bytes of 1080p
@@ -78,18 +88,18 @@ R_META = 30  # Number of metadata copies
 #   R=2 k=127 m=2 = 6.0 MB (was 7.25 at k=8)
 #   R=1 k=127 m=2 = 5.6 MB (was 6.73 at k=8)
 DENSITY_PROFILES = {
-    (1280, 720):  (8, 2, 127, 2, 'veryslow'),
-    (1920, 1080): (8, 2, 127, 2, 'veryslow'),
-    (3840, 2160): (8, 2, 21, 2, 'veryslow'),
+    (1280, 720):  (8, 2, 127, 2, 'slower'),
+    (1920, 1080): (8, 2, 127, 2, 'slower'),
+    (3840, 2160): (8, 2, 21, 2, 'slower'),
 }
 # Absolute-densest option (minimum size, thinnest protection) — use it when
 # the file will not be bounced through many re-encodes and the transport is
 # mostly drops/cuts (whole-group erasures), which m=2 still repairs.
 # 4K keeps k=21 (same single-stripe reason as the balance table).
 DENSITY_PROFILES_MAX = {
-    (1280, 720):  (8, 1, 127, 2, 'veryslow'),
-    (1920, 1080): (8, 1, 127, 2, 'veryslow'),
-    (3840, 2160): (8, 1, 21, 2, 'veryslow'),
+    (1280, 720):  (8, 1, 127, 2, 'slower'),
+    (1920, 1080): (8, 1, 127, 2, 'slower'),
+    (3840, 2160): (8, 1, 21, 2, 'slower'),
 }
 
 
@@ -1912,7 +1922,7 @@ if __name__ == "__main__":
     encode_parser.add_argument("--preset", type=str, default=None,
                                help="x264 preset: ultrafast..veryslow. "
                                     "Default: from the --auto profile "
-                                    "(veryslow for color), or 'medium' "
+                                    "('slower' for color), or 'medium' "
                                     "for explicit M/R encodes")
     encode_parser.add_argument("--fec-k", type=int, default=0,
                                help="FEC stripe: k data groups (0 = no FEC)")

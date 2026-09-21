@@ -86,19 +86,19 @@ python -m venv venv
 ### Recommended recipes (1080p / 4K)
 
 The measured-best recipe for both geometries is the same: **color mode,
-M=8, k=127/m=2 FEC, veryslow preset** — `--auto` picks exactly that.
+M=8, k=127/m=2 FEC, slower preset** — `--auto` picks exactly that.
 `--auto` (R=2) is the default: ~24% larger than the absolute-densest
 variant but keeps copy-averaging for platform re-encode robustness.
 `--auto --max-dense` (R=1) is the smallest video and still repairs up to
 2 whole-group losses per stripe — use it for files that will not be
 re-encoded again (local HDD → same machine).
 
-**1080p (1920×1080)** — ~6 MB of video per 2 MB of payload:
+**1080p (1920×1080)** — ~7 MB of video per 2 MB of payload:
 
 ```bash
-# balanced (default): ~6 MB out per 2 MB in
+# balanced (default): ~7 MB out per 2 MB in
 ./venv/bin/python VC7030_color.py encode my_file.bin 0 0 1920 1080 8 --color --auto
-# densest: ~5.6 MB out per 2 MB in
+# densest: ~6.4 MB out per 2 MB in
 ./venv/bin/python VC7030_color.py encode my_file.bin 0 0 1920 1080 8 --color --auto --max-dense
 ```
 
@@ -153,13 +153,13 @@ decode VIDEO PROCESSES
 | `WIDTH HEIGHT` | video geometry (even values) |
 | `PROCESSES` | worker count |
 | `--crf N` | x264 quality (default 23) |
-| `--preset NAME` | x264 preset `ultrafast`…`veryslow`. Default: from the `--auto` profile (`veryslow` for color), or `medium` for explicit M/R encodes |
+| `--preset NAME` | x264 preset `ultrafast`…`veryslow`. Default: from the `--auto` profile (`slower` for color), or `medium` for explicit M/R encodes |
 | `--out PATH` | output video (default `encoded/encoded_video.mp4`) |
 | `--fec-k K --fec-m M` | FEC stripe: `K` data + `M` parity groups (omit = no FEC; GF(256) cap `2k+m-2 ≤ 255`) |
 | `--tail-m T` | reinforced tail: `T` parity groups on the final stripe only (`T > M`); survives end-trimming by re-encoders like YouTube |
 | `--color` | color mode (default: grayscale) |
-| `--auto` | pick `M`, `R`, `k`/`m` and the x264 preset from the built-in density profile for the geometry — pass `0 0` and `--auto` (default = M=8 R=2, k=127 at 720p/1080p, k=21 at 4K — see the 4K note — veryslow — ~6 MB for 2 MB) |
-| `--max-dense` | with `--auto`: the absolute-densest profile (M=8 R=1, k=127, veryslow, ~5.6 MB for 2 MB) — thinnest protection, best for whole-group drops/cuts |
+| `--auto` | pick `M`, `R`, `k`/`m` and the x264 preset from the built-in density profile for the geometry — pass `0 0` and `--auto` (default = M=8 R=2, k=127 at 720p/1080p, k=21 at 4K — see the 4K note — slower — ~7 MB for 2 MB) |
+| `--max-dense` | with `--auto`: the absolute-densest profile (M=8 R=1, k=127, slower, ~6.4 MB for 2 MB) — thinnest protection, best for whole-group drops/cuts |
 | `--fps N` | container frame rate (default 30). Halves the video's wall-clock duration at 60; the payload is resolution-independent, so size and re-encode thresholds are unchanged. Note: 60 fps re-encodes are more fragile than 30 (see the 60 fps / 4K notes below) — use `--auto` (R=2) + `--tail-m`, not `--max-dense` |
 
 Explicit recipes (when you want to tune by hand):
@@ -210,22 +210,26 @@ recording mp4 size, byte-exactness, and the **minimum threshold margin** the
 decoder reports. `run_ksweep.py` sweeps the **stripe length k** (the last
 density lever): parity overhead is `m·ceil(n_data/k)/n_data`, so k=8 = 25.6%
 of groups, k=64 = 3.7%, **k=127 = 2.4%** — the GF(256) Cauchy cap for m=2
-(`2k+m-2 ≤ 255`). The winner is **M=8 at every geometry**, k=127, veryslow:
+(`2k+m-2 ≤ 255`). The winner is **M=8 at every geometry**, k=127, slower:
 
 | Geometry | M | R | k/m | preset | size (2 MB file) |
 |---|---|---|---|---|---|
-| 1280×720 | 8 | 2 | 127/2 | veryslow | ~5–6 MB |
-| 1920×1080 | 8 | 2 | 127/2 | veryslow | ~6 MB |
-| 3840×2160 | 8 | 2 | 127/2 | veryslow | ~6 MB |
+| 1280×720 | 8 | 2 | 127/2 | slower | ~5–7 MB |
+| 1920×1080 | 8 | 2 | 127/2 | slower | ~7 MB |
+| 3840×2160 | 8 | 2 | 21/2 | slower | ~7 MB |
 
 One long stripe (k=127) covers almost the whole file, so losses in
 *different places* are repaired, not just adjacent pairs — and m=2 costs
 only ~1.3% over m=1 at this k, so the double protection is nearly free.
-Slow preset: the flat DCT-aligned 0/255 blocks compress ~2× denser than
-medium (color R=1: 12 MB medium → 6 MB veryslow).
+Preset: the flat DCT-aligned 0/255 blocks compress well even at `slower`
+(28 fps), which the full 9-preset ladder measured as the knee — 4.7×
+faster than veryslow for +16% size, and the *highest* re-encode survival
+margin of the ladder (80.1% after AV1 13 Mbps). Below `slow` the size
+bloats; above it, pure time for nothing. Gray patterns are less regular
+(1 bit/block), so gray auto keeps `medium`.
 
 **Maximum-density option (`--auto --max-dense`):** M=8 **R=1** k=127 m=2,
-veryslow → ~5.6 MB (1080p), byte-exact, and it repairs real group cuts
+slower → ~6.4 MB (1080p), byte-exact, and it repairs real group cuts
 (1 and 2 lost groups → repaired, 10/10 as expected incl. the short last
 stripe). The trick: because M=8 is DCT-aligned, the threshold margin stays
 ~73–78% **even with a single copy** — compression flips no bits, so any
@@ -261,8 +265,8 @@ x264, CRF 23:
 
 | Source | Geometry | Mode | Result |
 |---|---|---|---|
-| 2 MB | 720p / 1080p / 4K | color + FEC, `--auto` (M=8 R=2 k=127 m=2, veryslow) | **~6 MB**, byte-exact |
-| 2 MB | 1080p | color + FEC, `--auto --max-dense` (R=1) | **~5.6 MB**, byte-exact |
+| 2 MB | 720p / 1080p / 4K | color + FEC, `--auto` (M=8 R=2 k=127 m=2, slower) | **~7 MB**, byte-exact |
+| 2 MB | 1080p | color + FEC, `--auto --max-dense` (R=1, slower) | **~6.4 MB**, byte-exact |
 | 2 MB | 1080p | color + FEC, `--auto --max-dense`, loss test | 1–2 group cuts repaired, 3 fails (10/10 as expected) |
 | 45 MB | 640×360 | color + FEC (M=16 R=2, 155 417 groups, both seq wraps) | byte-exact (wrap-boundary regression) |
 | 500 MB | 1080p | color + FEC (R=1, medium) | enc 993 s / dec 278 s, byte-exact, **flat ~2.2 GB RSS** (no leak) |
