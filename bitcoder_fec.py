@@ -14,6 +14,7 @@ repeated (R copies) exactly like data frames. The payload is byte-aligned
 """
 
 import hashlib
+import zlib
 
 import numpy as np
 
@@ -42,10 +43,6 @@ _EXP = np.array(_EXP_LIST, dtype=np.uint8)      # 512 entries, EXP[a+b] for a+b<
 _LOG = np.array(_LOG_LIST, dtype=np.uint8)
 _INV = np.array([0] + [int(_EXP_LIST[(255 - _LOG_LIST[i]) % 255]) for i in range(1, 256)],
                 dtype=np.uint8)
-
-
-def gf_inv(a):
-    return int(_INV[a])
 
 
 def _gf_mul_scalar(a, b):
@@ -185,7 +182,6 @@ def pack_header(g, data_part):
     assembler (the final hash check would then fail a stripe that was
     repairable). Tying the CRC to seq turns any seq damage into a plain
     erasure, which the MDS code repairs as usual."""
-    import zlib
     seq = (g & 0xFFFF).to_bytes(2, 'big')
     crc = zlib.crc32(seq + data_part) & 0xFFFFFFFF
     return (bytes([MAGIC]) + seq + crc.to_bytes(4, 'big') + bytes([SPARE]))
@@ -198,7 +194,6 @@ def unpack_header(h8):
     if h8[0] != MAGIC or h8[7] != SPARE:
         return None, False
     g = int.from_bytes(h8[1:3], 'big')
-    import zlib
     # crc is checked by the caller against the payload's data part
     return g, True
 
@@ -211,7 +206,6 @@ def crc_for_group(g, data_part):
     """The CRC a valid header for group g over data_part carries (seq field
     XOR-folded in — see pack_header). Decode-side verification must use this
     (not a bare crc32(payload)) or every group fails after the seq tie-in."""
-    import zlib
     return zlib.crc32((g & 0xFFFF).to_bytes(2, 'big') + data_part) & 0xFFFFFFFF
 
 
@@ -240,27 +234,6 @@ class SeqWrapTracker:
             self._wraps += 1
         self._last = seq
         return self._wraps * self.SEQ_MOD + seq
-
-
-def bits64_to_bytes(bits):
-    """First 64 bits (iterable of 0/1) -> 8 bytes, MSB-first."""
-    b = 0
-    for i in range(64):
-        b = (b << 1) | (1 if bits[i] else 0)
-    return b.to_bytes(8, 'big')
-
-
-def stripe_plan(df, k, m):
-    """Stripe geometry for df data frames: list of (data_start, k_in_stripe).
-    Total stream groups = df + len(strips) * m; stripe s occupies stream
-    indices [ds .. ds + k_s + m - 1] (parity right after its data)."""
-    strips = []
-    s = 0
-    while s * k < df:
-        k_s = min(k, df - s * k)
-        strips.append((s * k, k_s))
-        s += 1
-    return strips
 
 
 def render_payload(payload, M, width, height, header=None):

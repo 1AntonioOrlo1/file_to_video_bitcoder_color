@@ -136,7 +136,7 @@ Notes:
 ```
 encode FILE M R WIDTH HEIGHT PROCESSES [--crf N] [--out PATH]
        [--preset NAME] [--fec-k K] [--fec-m M] [--color] [--auto]
-       [--max-dense]
+       [--max-dense] [--fps N]
 decode VIDEO PROCESSES
 ```
 
@@ -154,6 +154,7 @@ decode VIDEO PROCESSES
 | `--color` | color mode (default: grayscale) |
 | `--auto` | pick `M`, `R`, `k`/`m` and the x264 preset from the built-in density profile for the geometry — pass `0 0` and `--auto` (default = M=8 R=2, k=127, veryslow — ~6 MB for 2 MB) |
 | `--max-dense` | with `--auto`: the absolute-densest profile (M=8 R=1, k=127, veryslow, ~5.6 MB for 2 MB) — thinnest protection, best for whole-group drops/cuts |
+| `--fps N` | container frame rate (default 30). Halves the video's wall-clock duration at 60; the payload is resolution-independent, so size and re-encode thresholds are unchanged. Note: 60 fps re-encodes are more fragile than 30 (see the 60 fps / 4K notes below) — use `--auto` (R=2) + `--tail-m`, not `--max-dense` |
 
 Explicit recipes (when you want to tune by hand):
 

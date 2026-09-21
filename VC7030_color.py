@@ -11,7 +11,6 @@ import subprocess
 from queue import Empty, Queue
 from multiprocessing.shared_memory import SharedMemory
 import threading
-import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 # FEC: systematic MDS erasure code over GF(256) — recovers up to m lost
@@ -19,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from bitcoder_fec import (HEADER_BYTES, HEADER_BITS, FecError, SeqWrapTracker,
                           cauchy_matrix,
                           crc_for_group, fec_decode, fec_encode, hash64_file,
-                          header_crc, pack_header, render_payload, stripe_plan,
+                          header_crc, pack_header, render_payload,
                           unpack_header)
 
 # Logging setup
@@ -296,10 +295,6 @@ def generate_data_frame(frame_idx, file_path, M, width, height, bits_per_frame, 
 # M must be EVEN so an MxM block covers whole yuv420p (4:2:0) chroma samples;
 # an odd M would split a chroma pixel across two blocks and smear the color.
 # ---------------------------------------------------------------------------
-COLOR_PALETTE = (
-    (0, 0, 0), (255, 0, 0), (0, 255, 0), (0, 0, 255),
-    (255, 0, 255), (0, 255, 255), (255, 255, 0), (255, 255, 255),
-)
 COLOR_BITS_PER_BLOCK = 3   # R, G, B — one bit per channel
 COLOR_CHANNELS = 3         # raw frame layout is (H, W, 3) rgb24
 
@@ -787,27 +782,12 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
             output_video_path
         ]
 
-        # stderr goes to a file (not DEVNULL) so a dying ffmpeg can be
-        # post-mortem'd instead of surfacing as a bare Broken pipe. Hidden
-        # dotfiles are rejected on some mounts, so use the scratch dir.
-        ffmpeg_stderr_path = (
-            os.path.join(os.path.expanduser(
-                "~/.hermes/cache/scratch"), "ffmpeg_encode_stderr.log")
-            if 'hsl_out' in os.path.basename(output_video_path)
-            else None
+        ffmpeg_process = subprocess.Popen(
+            ffmpeg_command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
-        _stderr_fh = (open(ffmpeg_stderr_path, 'w') if ffmpeg_stderr_path
-                      else subprocess.DEVNULL)
-        try:
-            ffmpeg_process = subprocess.Popen(
-                ffmpeg_command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=_stderr_fh
-            )
-        finally:
-            if ffmpeg_stderr_path is not None:
-                _stderr_fh.close()
 
         # Create meta-image and send to ffmpeg. The metadata frame's layout
         # matches the stream's input layout: rgb24 (RGB-gray) for color mode,
@@ -1445,6 +1425,8 @@ def decode_video_to_file(video_path, num_processes):
     reader_thread = None
     ffmpeg_process = None
     frame_queue = None
+    output_path = None
+    file_size = None
     try:
         start_time = time.time()
         recon_dir = get_reconstructed_directory()
@@ -1548,8 +1530,11 @@ def decode_video_to_file(video_path, num_processes):
             # Reinforced tail: the final stripe may carry more parity
             # (meta 'ml'); older videos have no key and use m everywhere.
             m_last = int(meta.get('ml', m_fec))
+            # A reinforced tail exists on the last stripe ALWAYS — including
+            # the single-stripe case (a file shorter than k groups): the
+            # encoder drew that stripe's parity with its own Pt matrix.
             Pt = (cauchy_matrix(k_last, m_last)
-                  if m_last != m_fec and n_strips > 1 else P)
+                  if m_last != m_fec else P)
             n_parity = (n_strips - 1) * m_fec + m_last
             total_groups = n_data + n_parity
             # The final stripe may be short AND carry a different parity
@@ -1697,17 +1682,11 @@ def decode_video_to_file(video_path, num_processes):
                          + (f", min threshold margin {min_margin:.3%}"
                             if min_margin is not None else "") + ")")
             success = True
-        if not success and os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-                logging.info("Removed incomplete reconstruction file")
-            except OSError:
-                pass
-        # The FEC branch owns the reader/ffmpeg (no shared pool), so tear
-        # them down here the way the legacy finally does.
-        _cleanup_decode(ffmpeg_process, reader_thread, stop_event,
-                        frame_queue)
-        return success
+            # The FEC branch owns the reader/ffmpeg (no shared pool), so tear
+            # them down here the way the legacy finally does.
+            _cleanup_decode(ffmpeg_process, reader_thread, stop_event,
+                            frame_queue)
+            return success
 
         # 5. Process data. Bits per block from the embedded `color` flag:
         # color = 3 (R,G,B 8-corner palette), gray = 1.
@@ -1892,6 +1871,15 @@ def decode_video_to_file(video_path, num_processes):
 
     except Exception as e:
         logging.error(f"Critical error during decoding: {str(e)}")
+        # Drop any partial reconstruction left behind by the failure.
+        try:
+            if (output_path is not None and file_size is not None
+                    and os.path.exists(output_path)
+                    and os.path.getsize(output_path) != file_size):
+                os.remove(output_path)
+                logging.info("Removed incomplete reconstruction file")
+        except OSError:
+            pass
         _cleanup_decode(ffmpeg_process, reader_thread, stop_event, frame_queue)
         return False
 
