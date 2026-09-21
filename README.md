@@ -102,13 +102,19 @@ re-encoded again (local HDD → same machine).
 ./venv/bin/python VC7030_color.py encode my_file.bin 0 0 1920 1080 8 --color --auto --max-dense
 ```
 
-**4K (3840×2160)** — same recipe, same density (stream volume is
-`~filesize·R·M²`, resolution-independent); the bigger canvas just fits
-more blocks per frame:
+**4K (3840×2160)** — same density, but a DIFFERENT stripe: k=21/m=2
+(`--auto` picks it). At 4K one group carries 4× the bytes, so a 2 MB file
+is only ~41 groups — with the 1080p stripe (k=127) that would be a SINGLE
+stripe with all parity in the tail, exactly where re-encoders trim. k=21
+splits it into two stripes (21+20) with a first parity pair in the MIDDLE,
+mirroring the 1080p structure. Cost: ~4% more groups. YouTube-verified
+2 MB PNG: 30fps → AV1 12 Mbps, margin 61%; 60fps → VP9 65 Mbps, margin 38%.
 
 ```bash
-./venv/bin/python VC7030_color.py encode my_file.bin 0 0 3840 2160 8 --color --auto
-./venv/bin/python VC7030_color.py encode my_file.bin 0 0 3840 2160 8 --color --auto --max-dense
+# 30 fps (verified on YouTube): add --tail-m 5 for a reinforced end
+./venv/bin/python VC7030_color.py encode my_file.bin 0 0 3840 2160 8 --color --auto --tail-m 5
+# 60 fps (verified on YouTube): needs the heavier tail
+./venv/bin/python VC7030_color.py encode my_file.bin 0 0 3840 2160 8 --color --auto --fps 60 --tail-m 15
 ```
 
 Decode is always the same two commands — parameters come from the
@@ -152,7 +158,7 @@ decode VIDEO PROCESSES
 | `--fec-k K --fec-m M` | FEC stripe: `K` data + `M` parity groups (omit = no FEC; GF(256) cap `2k+m-2 ≤ 255`) |
 | `--tail-m T` | reinforced tail: `T` parity groups on the final stripe only (`T > M`); survives end-trimming by re-encoders like YouTube |
 | `--color` | color mode (default: grayscale) |
-| `--auto` | pick `M`, `R`, `k`/`m` and the x264 preset from the built-in density profile for the geometry — pass `0 0` and `--auto` (default = M=8 R=2, k=127, veryslow — ~6 MB for 2 MB) |
+| `--auto` | pick `M`, `R`, `k`/`m` and the x264 preset from the built-in density profile for the geometry — pass `0 0` and `--auto` (default = M=8 R=2, k=127 at 720p/1080p, k=21 at 4K — see the 4K note — veryslow — ~6 MB for 2 MB) |
 | `--max-dense` | with `--auto`: the absolute-densest profile (M=8 R=1, k=127, veryslow, ~5.6 MB for 2 MB) — thinnest protection, best for whole-group drops/cuts |
 | `--fps N` | container frame rate (default 30). Halves the video's wall-clock duration at 60; the payload is resolution-independent, so size and re-encode thresholds are unchanged. Note: 60 fps re-encodes are more fragile than 30 (see the 60 fps / 4K notes below) — use `--auto` (R=2) + `--tail-m`, not `--max-dense` |
 

@@ -61,6 +61,15 @@ R_META = 30  # Number of metadata copies
 # so veryslow saves only ~17% and medium stays the balance.
 #
 # The stripe is k=127 (the GF(256) Cauchy cap for m=2: 2k+m-2 <= 255).
+# 4K is the exception: k=21. At 4K one group carries 4x the bytes of 1080p
+# (B=48576), so a 2 MB file is ~41 groups — with k=127 that is ONE stripe,
+# meaning all parity sits in the tail, exactly where platforms trim. k=21
+# splits the same file into two stripes (21+20), putting a first m=2 in the
+# MIDDLE of the video, mirroring the 1080p structure (127+37). Measured
+# 2 MB PNG: at the 13 Mbps budget b1 repairs 2 groups with 14% margin
+# where the k=127 baseline repairs 1 with 2.3% (on the knife's edge);
+# at real YouTube budgets (42–85 Mbps) both survive. YouTube-verified
+# (2026-09-21): 30fps AV1 12Mbps margin 61.2%, 60fps VP9 65Mbps margin 38.3%.
 # run_ksweep.py measured the parity overhead: k=8 = 25.6% of groups,
 # k=64 = 3.7%, k=127 = 2.4%. One long stripe covers almost the whole file
 # (164 data groups here), so losses in *different places* are repaired
@@ -71,15 +80,16 @@ R_META = 30  # Number of metadata copies
 DENSITY_PROFILES = {
     (1280, 720):  (8, 2, 127, 2, 'veryslow'),
     (1920, 1080): (8, 2, 127, 2, 'veryslow'),
-    (3840, 2160): (8, 2, 127, 2, 'veryslow'),
+    (3840, 2160): (8, 2, 21, 2, 'veryslow'),
 }
 # Absolute-densest option (minimum size, thinnest protection) — use it when
 # the file will not be bounced through many re-encodes and the transport is
 # mostly drops/cuts (whole-group erasures), which m=2 still repairs.
+# 4K keeps k=21 (same single-stripe reason as the balance table).
 DENSITY_PROFILES_MAX = {
     (1280, 720):  (8, 1, 127, 2, 'veryslow'),
     (1920, 1080): (8, 1, 127, 2, 'veryslow'),
-    (3840, 2160): (8, 1, 127, 2, 'veryslow'),
+    (3840, 2160): (8, 1, 21, 2, 'veryslow'),
 }
 
 
