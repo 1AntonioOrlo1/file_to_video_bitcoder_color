@@ -46,6 +46,13 @@ the motion you see.
   cut, or corrupted and are still recovered**. Works in both gray and color
   modes; group headers (magic + sequence + CRC-32) are drawn
   chroma-neutral so compression can never fake or break them.
+- **Reinforced tail (`--tail-m T`)** — the FINAL (short) stripe gets `T`
+  parity groups instead of `m`. Re-encoding platforms (YouTube in
+  particular) trim frames from the END of the video, so the last stripe is
+  the one that takes real damage; with `k=127, m=2` YouTube lost 3 tail
+  groups and the decode failed. `--tail-m 5` costs 3 frames and survives a
+  5-group tail trim (measured: cut of 5 repaired, cut of 6 fails as
+  designed). Older videos without the key decode unchanged.
 - **`--auto` density profiles** — pass `0 0 --auto` and the tool picks the
   measured-best recipe (M, R, k, m, x264 preset) for your geometry.
   `--auto --max-dense` picks the absolute-densest one.
@@ -143,6 +150,7 @@ decode VIDEO PROCESSES
 | `--preset NAME` | x264 preset `ultrafast`…`veryslow`. Default: from the `--auto` profile (`veryslow` for color), or `medium` for explicit M/R encodes |
 | `--out PATH` | output video (default `encoded/encoded_video.mp4`) |
 | `--fec-k K --fec-m M` | FEC stripe: `K` data + `M` parity groups (omit = no FEC; GF(256) cap `2k+m-2 ≤ 255`) |
+| `--tail-m T` | reinforced tail: `T` parity groups on the final stripe only (`T > M`); survives end-trimming by re-encoders like YouTube |
 | `--color` | color mode (default: grayscale) |
 | `--auto` | pick `M`, `R`, `k`/`m` and the x264 preset from the built-in density profile for the geometry — pass `0 0` and `--auto` (default = M=8 R=2, k=127, veryslow — ~6 MB for 2 MB) |
 | `--max-dense` | with `--auto`: the absolute-densest profile (M=8 R=1, k=127, veryslow, ~5.6 MB for 2 MB) — thinnest protection, best for whole-group drops/cuts |

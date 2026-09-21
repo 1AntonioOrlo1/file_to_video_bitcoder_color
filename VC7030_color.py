@@ -148,7 +148,7 @@ def create_meta_image(meta_data, width, height, rgb=False, block=None):
         # vs RGB-gray); the decoder keys off it to pick the matching decode
         # path, so it MUST be embedded. FEC keys are copied when present (FEC
         # is not supported in this fork, but kept for metadata symmetry).
-        for key in ('color', 'fec', 'k', 'm', 'pd', 'B', 'gh'):
+        for key in ('color', 'fec', 'k', 'm', 'ml', 'pd', 'B', 'gh'):
             if key in meta_data:
                 minimal_meta[key] = meta_data[key]
 
@@ -451,7 +451,8 @@ def _read_group_payload(fh, frame_idx, pd, group_bytes, total_bits):
 
 
 def _fec_group_frame(fh, frame_idx, M, width, height, pd,
-                     group_bytes, k, P, df, total_bits, color=False):
+                     group_bytes, k, P, df, total_bits, color=False,
+                     m_last=None, Pt=None):
     """Render stream group `frame_idx` for an FEC stream.
 
     Stream layout per stripe (size k + m): k data groups, then m parity
@@ -460,14 +461,20 @@ def _fec_group_frame(fh, frame_idx, M, width, height, pd,
     groups recompute their stripe's data payloads and encode over GF(256).
     `color` selects the 3-bit (8-corner) group layout; gray is the 1-bit
     one, byte-identical to the original program's render_payload.
+
+    Reinforced tail: with `m_last != m` (and the matching `Pt`), the FINAL
+    stripe alone uses m_last parity groups — the short last stripe is the
+    one platforms trim from the end of a re-encoded video, so it gets
+    extra redundancy at a cost of a few frames.
     """
     m = P.shape[1]
-    # The final stripe may be short (k_s < k): its stream stride is
-    # k_s + m, so map stream index -> (stripe, within-stripe index) by
-    # carving it off from the end.
+    ml = P.shape[1] if m_last is None else m_last
+    # The final stripe may be short (k_s < k) and may carry a different
+    # parity count, so map stream index -> (stripe, within-stripe index)
+    # by carving it off from the end.
     n_strips = (df + k - 1) // k
     k_last = df - (n_strips - 1) * k
-    last_ss = df + n_strips * m - (k_last + m)
+    last_ss = df + (n_strips - 1) * m + ml - (k_last + ml)
     if frame_idx >= last_ss:
         s, idx_in = n_strips - 1, frame_idx - last_ss
     else:
@@ -483,8 +490,10 @@ def _fec_group_frame(fh, frame_idx, M, width, height, pd,
                                                            total_bits),
                                        dtype=np.uint8)
                          for i in range(k_s)])
-        # P is sized (k, m); a short last stripe only needs its first k_s rows
-        parity = fec_encode(data, P[:k_s])
+        # P is sized (k, m); a short last stripe only needs its first k_s
+        # rows; the tail stripe uses its own (k_s, m_last) matrix Pt.
+        Pm = P if s < n_strips - 1 else (Pt if Pt is not None else P)
+        parity = fec_encode(data, Pm[:k_s])
         payload = parity[idx_in - k_s].tobytes()
     try:
         # 8-byte group header (magic, seq, crc32(payload), spare) in the first
@@ -544,7 +553,8 @@ def render_color_payload(payload, M, width, height, header=None):
 
 def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_bytes,
                        file_path, M, width, height, bits_per_frame, total_bits,
-                       P=None, k_fec=0, pd=0, group_bytes=0, df=0, color=False):
+                       P=None, k_fec=0, pd=0, group_bytes=0, df=0, color=False,
+                       m_last=None, Pt=None):
     """Encode worker: renders frame `frame_idx` straight into its pool slot
     (frame_idx % n_slots) and reports (frame_idx, slot) on the out queue.
     `slot == -1` signals a generation error. The semaphore guards the slot
@@ -572,7 +582,8 @@ def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_by
             if k_fec > 0:
                 img = _fec_group_frame(fh, frame_idx, M, width, height,
                                        pd, group_bytes, k_fec, P, df,
-                                       total_bits, color=color)
+                                       total_bits, color=color,
+                                       m_last=m_last, Pt=Pt)
             elif color:
                 # 8-corner RGB palette, 3 file bits per block.
                 img = generate_color_frame(frame_idx, file_path, M, width, height,
@@ -604,7 +615,7 @@ def _shm_encode_worker(task_queue, out_queue, sems, pool_name, n_slots, frame_by
 
 def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
                          out_path=None, fec_k=0, fec_m=0, preset='medium',
-                         color=False):
+                         color=False, tail_m=None):
     try:
         start_time = time.time()
         output_dir = get_output_directory()
@@ -663,6 +674,8 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
 
         use_fec = 0
         k_fec = m_fec = 0
+        m_last = None
+        Pt = None
         B = max(0, (bits_per_frame - (3 if color else 1) * HEADER_BITS) // 8)
         P = None
         n_data = 0
@@ -688,10 +701,34 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
             k_fec, m_fec = fec_k, fec_m
             n_data = (file_size + B - 1) // B      # data groups
             P = cauchy_matrix(k_fec, m_fec)
-            total_frames = n_data + len(stripe_plan(n_data, k_fec, m_fec)) * m_fec
+            # Reinforced tail: give ONLY the final (short) stripe more
+            # parity. Platforms re-encoding the video trim frames from the
+            # end, so the last stripe is the one that sees real damage.
+            # It is short, so 2*k_last + m_last - 2 stays inside GF(256)
+            # long after 2*k_fec + m_fec - 2 hits the cap.
+            m_last = m_fec
+            Pt = P
+            n_strips = (n_data + k_fec - 1) // k_fec
+            if tail_m is not None:
+                if tail_m <= m_fec:
+                    logging.error(f"--tail-m {tail_m} must exceed --fec-m "
+                                  f"{m_fec}")
+                    return False
+                k_last = n_data - (n_strips - 1) * k_fec
+                if 2 * k_last + tail_m - 2 > 255:
+                    logging.error(
+                        f"tail stripe k={k_last} m_last={tail_m} exceeds the "
+                        f"GF(256) Cauchy cap (2k+m-2={2 * k_last + tail_m - 2} > 255)")
+                    return False
+                m_last = tail_m
+                Pt = cauchy_matrix(k_last, m_last)
+            total_frames = n_data + (n_strips - 1) * m_fec + m_last
             logging.info(f"FEC enabled: k={k_fec}, m={m_fec}, B={B} bytes/group, "
-                         f"{n_data} data + {len(stripe_plan(n_data, k_fec, m_fec)) * m_fec} "
-                         f"parity groups = {total_frames} stream groups")
+                         f"{n_data} data + {(n_strips - 1) * m_fec + m_last} "
+                         f"parity groups = {total_frames} stream groups"
+                         + (f" (tail stripe: m_last={m_last}, "
+                            f"k_last={n_data - (n_strips - 1) * k_fec})"
+                            if m_last != m_fec else ""))
         else:
             total_frames = (total_bits + bits_per_frame - 1) // bits_per_frame
 
@@ -714,6 +751,8 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
                 _gh = hash64_file(_f)
             meta.update({'fec': 1, 'k': k_fec, 'm': m_fec, 'pd': n_data,
                          'B': B, 'gh': _gh})
+            if m_last != m_fec:
+                meta['ml'] = m_last
 
         # Input layout is mode-dependent: color frames are rgb24 (H, W, 3);
         # gray frames are 1-channel (H, W), identical to the original program,
@@ -802,7 +841,7 @@ def encode_file_to_video(file_path, M, R, width, height, num_processes, crf=23,
                 target=_shm_encode_worker,
                 args=(task_queue, out_queue, pool_sems, pool_name, pool_n, frame_size,
                       file_path, M, width, height, bits_per_frame, total_bits,
-                      P, k_fec, B * 8, B, n_data, color)
+                      P, k_fec, B * 8, B, n_data, color, m_last, Pt)
             )
             p.start()
             workers.append(p)
@@ -1494,14 +1533,20 @@ def decode_video_to_file(video_path, num_processes):
             gh = meta.get('gh', '')
             P = cauchy_matrix(k_fec, m_fec)
             n_strips = (n_data + k_fec - 1) // k_fec
-            n_parity = n_strips * m_fec
-            total_groups = n_data + n_parity
-            # The final stripe may be short: carve it off from the end, as
-            # the encoder does (its stride is k_last + m, not k + m).
             k_last = n_data - (n_strips - 1) * k_fec
-            last_ss = total_groups - (k_last + m_fec)
-            logging.info(f"FEC decode: k={k_fec}, m={m_fec}, {n_data} data + "
-                         f"{n_parity} parity = {total_groups} groups")
+            # Reinforced tail: the final stripe may carry more parity
+            # (meta 'ml'); older videos have no key and use m everywhere.
+            m_last = int(meta.get('ml', m_fec))
+            Pt = (cauchy_matrix(k_last, m_last)
+                  if m_last != m_fec and n_strips > 1 else P)
+            n_parity = (n_strips - 1) * m_fec + m_last
+            total_groups = n_data + n_parity
+            # The final stripe may be short AND carry a different parity
+            # count: carve it off from the end, as the encoder does.
+            last_ss = total_groups - (k_last + m_last)
+            logging.info(f"FEC decode: k={k_fec}, m={m_fec}, "
+                         f"{'m_last=' + str(m_last) + ', ' if m_last != m_fec else ''}"
+                         f"{n_data} data + {n_parity} parity = {total_groups} groups")
 
             def _stream_of(s, idx_in):
                 if s < n_strips - 1:
@@ -1551,16 +1596,23 @@ def decode_video_to_file(video_path, num_processes):
 
             def _flush_stripe(s):
                 # Assemble stripe s (missing groups are None) and write its
-                # data payload to the file, in order.
+                # data payload to the file, in order. The tail stripe uses
+                # its own parity count (m_last) and matrix (Pt).
                 nonlocal repaired
                 k_s = min(k_fec, n_data - s * k_fec)
-                recv = [stripe_bufs[s].get(i) for i in range(k_s + m_fec)]
+                m_s = m_last if s == n_strips - 1 else m_fec
+                P_s = Pt if s == n_strips - 1 else P
+                recv = [stripe_bufs[s].get(i) for i in range(k_s + m_s)]
                 n_lost = sum(1 for x in recv if x is None)
-                if n_lost > m_fec:
+                if n_lost > m_s:
+                    lost_idx = [i for i, x in enumerate(recv) if x is None]
+                    if os.environ.get('FEC_LOST_DEBUG'):
+                        print(f"[fec-lost-debug] stripe {s}: lost={lost_idx} "
+                              f"({n_lost} of {k_s + m_s})", flush=True)
                     raise FecError(
-                        f"stripe {s}: {n_lost} of {k_s + m_fec} "
-                        f"groups lost ({m_fec} correctable)")
-                data = fec_decode(recv, k_s, P)
+                        f"stripe {s}: {n_lost} of {k_s + m_s} "
+                        f"groups lost ({m_s} correctable)")
+                data = fec_decode(recv, k_s, P_s)
                 for i in range(k_s):
                     if recv[i] is None:
                         repaired += 1
@@ -1595,7 +1647,8 @@ def decode_video_to_file(video_path, num_processes):
                         while (next_stripe < n_strips and
                                len(stripe_bufs[next_stripe]) ==
                                min(k_fec, n_data - next_stripe * k_fec)
-                               + m_fec):
+                               + (m_last if next_stripe == n_strips - 1
+                                  else m_fec)):
                             _flush_stripe(next_stripe)
                             next_stripe += 1
                     # EOF: flush every remaining stripe in order; losses
@@ -1856,6 +1909,12 @@ if __name__ == "__main__":
                                help="FEC stripe: k data groups (0 = no FEC)")
     encode_parser.add_argument("--fec-m", type=int, default=0,
                                help="FEC stripe: m parity groups (0 = no FEC)")
+    encode_parser.add_argument("--tail-m", type=int, default=None,
+                               help="Reinforced tail: parity count for the "
+                                    "FINAL stripe only (must exceed --fec-m). "
+                                    "The short last stripe is the one a "
+                                    "re-encoding platform trims, so it gets "
+                                    "extra redundancy at a cost of a few frames")
     encode_parser.add_argument("--auto", action="store_true",
                                help="Pick M/R (and k/m when --fec-k is not given) "
                                     "from the built-in density profile for "
@@ -1904,7 +1963,7 @@ if __name__ == "__main__":
             # modes (veryslow is a 3.7x cost for ~17% in gray, not worth
             # making the default when the user is dialing in by hand).
             args.preset = 'medium'
-        if encode_file_to_video(args.file_path, M, R, args.width, args.height, args.processes, crf=args.crf, out_path=args.out, fec_k=fec_k, fec_m=fec_m, preset=args.preset, color=args.color):
+        if encode_file_to_video(args.file_path, M, R, args.width, args.height, args.processes, crf=args.crf, out_path=args.out, fec_k=fec_k, fec_m=fec_m, preset=args.preset, color=args.color, tail_m=args.tail_m):
             elapsed = time.time() - start_time
             print(f"Encoding completed successfully in {elapsed:.2f} sec")
         else:
