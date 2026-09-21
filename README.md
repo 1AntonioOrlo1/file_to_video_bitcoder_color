@@ -282,7 +282,10 @@ edge cases (empty file, exact-frame boundaries, odd $M$ rejected, odd
 dimensions rejected, $M \in \{4,6,8,12,16\}$, process-count determinism);
 FEC cross-compatibility with the upstream program; rescaled-video clean
 failure; and the 1 GiB 4K gray/color/FEC finals. All cells round-trip
-byte-exact. Helper harnesses in this repo: `run_profiles.py` (density),
+byte-exact. Helper harnesses in this repo: `run_regress.sh` (fast 7-scenario
+byte-exact regression over every encode/decode path — run it after any
+change to the pipeline; the two legacy no-FEC scenarios are mandatory),
+`run_profiles.py` (density),
 `run_ksweep.py` (stripe length), `run_sweep.py` (R/m), `run_loss.py`
 (FEC erasure injection), `run_memtest.py` (big-file RSS sampling),
 `run_wraptest.py` (16-bit seq wrap boundaries), `proto_16color.py`
